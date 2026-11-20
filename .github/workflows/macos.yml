@@ -1,0 +1,29 @@
+name: macOS
+
+on:
+  push:
+    branches: [macos]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Sonda (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Sistema
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          python3 --version
+          python3 -c "import tkinter; print('Tk', tkinter.TkVersion)" || true
+          brew --version | head -1
+          ls /Applications | head -40
+          echo "GUI: $(launchctl print gui/$(id -u) >/dev/null 2>&1 && echo sim || echo nao)"
