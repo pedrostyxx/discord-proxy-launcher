@@ -99,7 +99,7 @@ class SshCase(unittest.TestCase):
         self._tunnels = []
         self.addCleanup(self._stop_everything)
 
-    def _discord_check(self, proxy, timeout=None):
+    def _discord_check(self, proxy, timeout=None, reject_countries=None):
         if not self.discord_reachable:
             raise TimeoutError("Discord fora de alcance (teste)")
         return proxies.CheckResult(connect_ms=5.0, total_ms=10.0)

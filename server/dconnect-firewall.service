@@ -1,0 +1,7 @@
+[Unit]
+Description=dconnect - confere as regras de saída do usuário dconnect
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/dconnect/firewall.sh --ensure

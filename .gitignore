@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 *.spec
 discord-proxy-launcher.log
+# servidor dedicado: tem o token do app, nunca vai para o Git
+dconnect.json

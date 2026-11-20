@@ -1,0 +1,54 @@
+[Unit]
+Description=dconnect - servidor dedicado do Discord Proxy Launcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=dconnect
+Group=dconnect
+# Regras de saída do usuário dconnect, refeitas antes de cada início ("+": roda como
+# root, sem as restrições abaixo). Se falharem, o serviço não sobe.
+ExecStartPre=+/opt/dconnect/firewall.sh
+ExecStart=/usr/bin/python3 -I /opt/dconnect/dconnect_server.py --config /etc/dconnect/config.json
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=65536
+MemoryMax=2G
+TasksMax=256
+UMask=0077
+
+# Sem privilégio nenhum: escuta só em 127.0.0.1 (o cloudflared entrega as conexões).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Segunda camada (além das regras de firewall.sh): nada de redes internas. Os
+# resolvedores DNS do sistema, mesmo nessas faixas (nuvens usam 169.254.169.254,
+# 172.31.0.2...), são liberados em dconnect.service.d/resolvers.conf, que o
+# install.sh gera a cada execução (IPAddressAllow vale mais que IPAddressDeny).
+IPAddressDeny=link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

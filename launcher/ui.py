@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import queue
 import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox
 
-from . import config, session
+from . import config, session, win
+from .log import log
 from .target import parse_target
 
 BG = "#1e1f22"
@@ -24,6 +26,13 @@ NEUTRAL_HOVER = "#6d6f78"
 DISABLED = "#383a40"
 WARNING = "#f0b232"
 WARNING_BG = "#352d1c"
+SUCCESS = "#3ba55c"
+SUCCESS_BG = "#1b2f22"
+LINK = "#00a8fc"
+VPS_CALL_NOTE = (
+    "Numa ligação, cada pessoa se conecta ao Discord pela própria internet: para que tudo funcione "
+    "para todos, quem também estiver com o Discord bloqueado ou instável precisa estar com este app aberto."
+)
 STATUS_COLORS = {
     session.BLUE: "#3b9eff",
     session.YELLOW: "#f5d90a",
@@ -46,7 +55,7 @@ class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title(config.APP_NAME)
+        self.root.title(config.WINDOW_TITLE)
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         try:
@@ -64,6 +73,11 @@ class App:
         self._start_buttons: list[tk.Button] = []
         self._stop_buttons: list[tk.Button] = []
         self._locked_while_running: list[tk.Widget] = []
+        self._notice_panels: dict[str | None, tk.Frame] = {}
+        self._notice: str | None = None
+        self._links: dict[str, tk.Label] = {}
+        self._opening_link = False
+        self._dedicated = config.load_dedicated()
 
         self._build()
         self._show("home")
@@ -103,11 +117,16 @@ class App:
         for frame in self._screens.values():
             frame.grid(row=0, column=0, sticky="nsew")
         self.root.update_idletasks()
+        # Medido com todos os avisos do modo público no mesmo lugar (vale a altura do
+        # maior); depois o lugar fica com essa altura e só o aviso do momento aparece.
+        self._notice_holder.configure(height=self._notice_holder.winfo_reqheight())
+        self._notice_holder.grid_propagate(False)
         height = max(frame.winfo_reqheight() for frame in self._screens.values())
         self._container.configure(width=self.px(CONTENT_WIDTH), height=height)
         self._container.grid_propagate(False)
         self._container.grid_rowconfigure(0, weight=1)
         self._container.grid_columnconfigure(0, weight=1)
+        self._apply_notice(None)
 
         bar = tk.Frame(self.root, bg=SURFACE)
         bar.pack(fill="x", side="bottom", pady=(self.px(16), 0))
@@ -129,8 +148,12 @@ class App:
             frame, "\U0001F5A5", "Meu servidor", "Tenho um VPS ou servidor SSH",
             lambda: self._show("ssh"),
         ).pack(fill="both", expand=True, pady=(0, self.px(12)))
+        public_subtitle = (
+            "Não tenho servidor: usar o servidor grátis do app" if self._dedicated
+            else "Não tenho servidor, usar lista grátis"
+        )
         self._card(
-            frame, "\U0001F310", "Proxy público", "Não tenho servidor, usar lista grátis",
+            frame, "\U0001F310", "Proxy público", public_subtitle,
             lambda: self._show("public"),
         ).pack(fill="both", expand=True)
         return frame
@@ -222,34 +245,129 @@ class App:
         frame = tk.Frame(parent, bg=BG)
         self._screen_header(frame, "Proxy público")
 
-        banner = tk.Frame(frame, bg=WARNING_BG)
-        banner.pack(fill="x")
-        tk.Frame(banner, bg=WARNING, width=self.px(4)).pack(side="left", fill="y")
-        body = tk.Frame(banner, bg=WARNING_BG)
-        body.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(10))
-        tk.Label(
-            body, text="⚠  Proxies gratuitos podem ser instáveis.",
-            font=(FONT, 10, "bold"), fg=WARNING, bg=WARNING_BG, anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            body,
-            text=(
-                "O app monitora a conexão e troca de proxy automaticamente se detectar "
-                "queda, mas você pode perceber uma breve interrupção no Discord durante a troca."
-            ),
-            font=(FONT, 9), fg=TEXT, bg=WARNING_BG, justify="left", anchor="w",
-            wraplength=self.px(CONTENT_WIDTH - 44),
-        ).pack(fill="x", pady=(self.px(4), 0))
+        # Os avisos ocupam o mesmo lugar e a altura do maior deles: trocar de aviso
+        # não mexe no resto da tela, e a janela já nasce com o tamanho certo.
+        holder = tk.Frame(frame, bg=BG)
+        holder.pack(fill="x")
+        holder.grid_columnconfigure(0, weight=1)
+        self._notice_panels = {None: self._warning_panel(holder)}
+        if self._dedicated:             # sem servidor dedicado neste build, esses avisos nunca aparecem
+            self._notice_panels["vps"] = self._vps_panel(holder)
+            self._notice_panels["vps_update"] = self._update_panel(holder)
+        for panel in self._notice_panels.values():
+            panel.grid(row=0, column=0, sticky="new")
+        self._notice_holder = holder
 
+        description = (
+            "Nada para preencher: o app usa o servidor dedicado gratuito e, se ele estiver fora do ar, "
+            "testa os proxies públicos e usa o mais rápido."
+            if self._dedicated else
+            "Nada para preencher: o app baixa a lista, testa os proxies e usa o mais rápido."
+        )
         tk.Label(
-            frame,
-            text="Nada para preencher: o app baixa a lista, testa os proxies e usa o mais rápido.",
+            frame, text=description,
             font=(FONT, 9), fg=MUTED, bg=BG, justify="left", anchor="w",
             wraplength=self.px(CONTENT_WIDTH),
         ).pack(fill="x", pady=(self.px(12), 0))
 
         self._buttons(frame, self._start_public)
         return frame
+
+    def _panel(self, parent, accent: str, background: str) -> tuple[tk.Frame, tk.Frame]:
+        panel = tk.Frame(parent, bg=background)
+        tk.Frame(panel, bg=accent, width=self.px(4)).pack(side="left", fill="y")
+        body = tk.Frame(panel, bg=background)
+        body.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(10))
+        return panel, body
+
+    def _text(self, body, text: str, background: str, size: int = 9, color: str = TEXT, top: int = 4) -> None:
+        tk.Label(
+            body, text=text, font=(FONT, size), fg=color, bg=background, justify="left", anchor="w",
+            wraplength=self.px(CONTENT_WIDTH - 44),
+        ).pack(fill="x", pady=(self.px(top), 0))
+
+    def _link(self, body, text: str, url: str, background: str) -> None:
+        link = tk.Label(body, text=text, font=(FONT, 9, "bold", "underline"), fg=LINK, bg=background,
+                        cursor="hand2", anchor="w")
+        link.pack(fill="x", pady=(self.px(2), 0))
+        link.bind("<Button-1>", lambda _event: self._open_link(url))
+        link.original_text = text
+        self._links[url] = link
+
+    def _warning_panel(self, parent) -> tk.Frame:
+        panel, body = self._panel(parent, WARNING, WARNING_BG)
+        tk.Label(
+            body, text="⚠  Proxies gratuitos podem ser instáveis.",
+            font=(FONT, 10, "bold"), fg=WARNING, bg=WARNING_BG, anchor="w",
+        ).pack(fill="x")
+        self._text(body, (
+            "O app monitora a conexão e troca de proxy automaticamente se detectar "
+            "queda, mas você pode perceber uma breve interrupção no Discord durante a troca."
+        ), WARNING_BG)
+        return panel
+
+    def _vps_panel(self, parent) -> tk.Frame:
+        panel, body = self._panel(parent, SUCCESS, SUCCESS_BG)
+        tk.Label(
+            body, text=f"✓  Servidor dedicado de {config.DEDICATED_OWNER}",
+            font=(FONT, 10, "bold"), fg=SUCCESS, bg=SUCCESS_BG, anchor="w",
+        ).pack(fill="x")
+        self._text(body, (
+            f"Você está usando um servidor dedicado fornecido gratuitamente por {config.DEDICATED_OWNER}. "
+            "Como agradecimento, siga no Instagram:"
+        ), SUCCESS_BG)
+        self._link(body, f"@{config.DEDICATED_OWNER}  ↗", config.INSTAGRAM_URL, SUCCESS_BG)
+        self._text(body, VPS_CALL_NOTE, SUCCESS_BG, size=8, color=MUTED, top=6)
+        return panel
+
+    def _update_panel(self, parent) -> tk.Frame:
+        panel, body = self._panel(parent, WARNING, WARNING_BG)
+        tk.Label(
+            body, text="⚠  Atualize o app para usar o servidor dedicado",
+            font=(FONT, 10, "bold"), fg=WARNING, bg=WARNING_BG, anchor="w",
+        ).pack(fill="x")
+        self._text(body, (
+            "O servidor dedicado não aceita mais esta versão do app. Enquanto isso, ele usa os proxies "
+            "públicos. Baixe a versão nova:"
+        ), WARNING_BG)
+        self._link(body, "Página de downloads  ↗", config.RELEASES_URL, WARNING_BG)
+        return panel
+
+    def _apply_notice(self, kind: str | None) -> None:
+        kind = kind if kind in self._notice_panels else None
+        self._notice = kind
+        for key, panel in self._notice_panels.items():
+            if key == kind:
+                panel.grid()
+            else:
+                panel.grid_remove()
+
+    def _copied(self, url: str) -> None:
+        """Não abriu o navegador: copia o link e avisa no próprio link (a linha de status é da sessão)."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        link = self._links.get(url)
+        if link is None:
+            return
+        link.configure(text="Link copiado — cole no navegador")
+        self._timers["link"] = self.root.after(4000, lambda: link.configure(text=link.original_text))
+
+    def _open_link(self, url: str) -> None:
+        """Abre o link no navegador do usuário — pelo Explorer, nunca como administrador."""
+        if self._opening_link:
+            return
+        self._opening_link = True
+
+        def worker() -> None:
+            try:
+                win.open_url(url)
+            except OSError as exc:
+                log.info("não foi possível abrir %s: %s", url, exc)
+                self._events.put(("copy_link", url))
+            finally:
+                self._opening_link = False
+
+        threading.Thread(target=worker, name="open-link", daemon=True).start()
 
     def _buttons(self, frame: tk.Frame, start_command) -> None:
         row = tk.Frame(frame, bg=BG)
@@ -329,12 +447,16 @@ class App:
     def _start_public(self) -> None:
         if self._session is not None:
             return
-        self._begin(session.PublicSession(on_status=self._post_status, on_finish=self._post_finish))
+        self._begin(session.PublicSession(
+            dedicated=self._dedicated,
+            on_status=self._post_status, on_finish=self._post_finish, on_notice=self._post_notice,
+        ))
 
     def _begin(self, new_session: session.Session) -> None:
         self._session = new_session
         self._stopping = False
         self._pending_status = None
+        self._apply_notice(None)
         self._set_running(True)
         self._set_status(session.BLUE, "Conectando...")
         new_session.start()
@@ -370,6 +492,9 @@ class App:
     def _post_finish(self) -> None:
         self._events.put(("finished",))
 
+    def _post_notice(self, kind: str | None) -> None:
+        self._events.put(("notice", kind))
+
     def _drain_events(self) -> None:
         try:
             while True:
@@ -379,8 +504,14 @@ class App:
                         self._pending_status = event[1:]     # só o último importa
                     else:
                         self._set_status(*event[1:])
+                elif event[0] == "notice":
+                    self._apply_notice(event[1])          # vale mesmo encerrando (o último é "nenhum")
+                elif event[0] == "copy_link":
+                    self._copied(event[1])
                 elif event[0] == "finished":
                     self._session = None
+                    if self._notice == "vps":                 # a sessão acabou: o servidor não está mais em uso
+                        self._apply_notice(None)
                     if self._closing:
                         self._destroy()
                         return

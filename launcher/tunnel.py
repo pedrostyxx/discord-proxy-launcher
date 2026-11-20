@@ -283,8 +283,9 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
 class _SocksServer:
     """Servidor SOCKS5 local (só CONNECT, sem autenticação, só em 127.0.0.1).
 
-    Cada conexão aceita vira um canal `direct-tcpip` no túnel SSH — é o que o
-    `ssh -D` faz.
+    Cada conexão aceita vira o canal que `open_channel(host, porta, origem)`
+    devolver: no túnel embutido, um canal `direct-tcpip` no SSH (é o que o
+    `ssh -D` faz); no modo Proxy público, uma conexão por um proxy público.
     """
 
     def __init__(self, port: int, open_channel):
@@ -368,7 +369,7 @@ class _SocksServer:
                 return
             except Exception as exc:
                 log.debug("canal para %s:%s falhou: %s", host, port, exc)
-                self._reply(client, 1)
+                self._reply(client, getattr(exc, "socks_reply", None) or 1)
                 return
             self._reply(client, 0)
             client.settimeout(None)

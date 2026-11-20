@@ -1,9 +1,10 @@
 """Ajuda dos testes: abre o Discord falso como o launcher elevado abriria.
 
 Uso: python elevated_creator.py <raiz_do_projeto> <exe_do_discord_falso> <modo> [--sem-correcao]
-  modo: explorer        como filho do Explorer (o caminho normal do launcher elevado)
+  modo: pelo-explorer   pedindo ao Explorer que abra (o caminho normal do launcher elevado)
+        explorer        como filho do Explorer (o primeiro plano B)
         explorer-sddl   idem, sem acesso ao token do Explorer (vale o DACL montado a partir do SID)
-        limitado        com o token rebaixado do próprio processo (o plano B)
+        limitado        com o token rebaixado do próprio processo (o último plano B)
 
 Antes de abrir, troca o DACL padrão deste processo por "só Administradores e
 SYSTEM" — o DACL padrão de um processo elevado. É assim que dá para reproduzir,
@@ -65,6 +66,8 @@ if mode == "explorer-sddl":
 arguments = [os.path.join(os.path.dirname(exe), "fakechat.py"), "--proxy-server=socks5://127.0.0.1:9"]
 if mode == "limitado":
     pid = win.spawn_with_limited_token(exe, arguments)
+elif mode == "pelo-explorer":
+    pid = win.spawn_via_explorer(exe, arguments)
 else:
     pid = win.spawn_as_desktop_user(exe, arguments)
 print(pid)

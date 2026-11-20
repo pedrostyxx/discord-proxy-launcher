@@ -5,8 +5,8 @@
 <h1 align="center">Discord Proxy Launcher</h1>
 
 <p align="center">
-  Abre o Discord através de um proxy — pelo seu próprio servidor ou por proxies gratuitos —<br>
-  sem VPN, sem instalar nada e sem mexer no resto do computador.
+  Abre o Discord através de um proxy — o seu próprio servidor ou, sem servidor, o servidor dedicado gratuito<br>
+  do app e proxies públicos, sempre fora do Brasil —, sem VPN, sem instalar nada e sem mexer no resto do computador.
 </p>
 
 <p align="center">
@@ -41,9 +41,9 @@ Ao abrir, você escolhe um de dois modos:
 |---|---|---|
 | **Para quem** | tem um VPS ou servidor com SSH | não tem servidor |
 | **O que você preenche** | o IP do servidor (porta, usuário e senha são opcionais) | nada |
-| **Como funciona** | cria um túnel SSH até o seu servidor e passa o Discord por ele | baixa listas de proxies SOCKS5 gratuitos, testa vários ao mesmo tempo e usa o mais rápido |
-| **Se a conexão cair** | reconecta o túnel sozinho (até 3 tentativas) | passa para o próximo proxy da fila e reabre o Discord em poucos segundos |
-| **Estabilidade** | a do seu servidor — a melhor opção | proxies gratuitos caem com frequência; o app troca sozinho |
+| **Como funciona** | cria um túnel SSH até o seu servidor e passa o Discord por ele | usa o **servidor dedicado gratuito** oferecido por [pedrostyxx](https://www.instagram.com/pedrostyxx/) (saída na França); se ele estiver fora do ar, baixa listas de proxies SOCKS5 gratuitos, testa vários ao mesmo tempo e usa o mais rápido que sai fora do Brasil |
+| **Se a conexão cair** | reconecta o túnel sozinho (até 3 tentativas) | passa para os proxies públicos (e volta ao servidor dedicado quando ele voltar), sem fechar o Discord |
+| **Estabilidade** | a do seu servidor — a melhor opção | a do servidor dedicado; os proxies gratuitos de reserva caem com frequência e o app troca sozinho |
 
 Nos dois modos:
 
@@ -73,10 +73,14 @@ O proxy leva o "Discord de texto": login, mensagens, servidores, canais, imagens
 de mídia do próprio Discord, direto para os servidores de voz.
 
 Na prática: **chamadas e compartilhamento de tela funcionam tranquilamente**, sem ficar lentos ou travando por
-causa do proxy — mesmo com os proxies gratuitos.
+causa do proxy — mesmo com os proxies gratuitos. O único efeito é indireto: o Discord pode escolher um servidor de
+voz perto do país do proxy (veja [Limitações](#limitações)).
 
 > **Bom saber:** como as chamadas não passam pelo proxy, os servidores de voz do Discord veem o seu IP real
-> durante uma chamada. Se o seu objetivo for esconder o IP, o proxy cobre o resto do Discord, mas não as chamadas.
+> durante uma chamada. E, enquanto o app usa o **servidor dedicado**, também saem direto pela sua conexão o envio
+> de anexos (que vai para o Google), as *Activities* (os jogos e apps dentro das chamadas) e as integrações, como
+> YouTube e Spotify. Se o seu objetivo for esconder o IP, use o modo **Meu servidor**: ele leva todo o resto do
+> Discord — só as chamadas ficam de fora.
 
 ## Como usar
 
@@ -89,19 +93,20 @@ causa do proxy — mesmo com os proxies gratuitos.
    - **Meu servidor:** digite o IP (ou o endereço) do servidor. A porta (22) e o usuário (root) já vêm
      preenchidos. Informe a senha ou deixe em branco para usar a sua chave SSH (`id_ed25519`, `id_ecdsa` ou
      `id_rsa` na pasta `.ssh` do seu usuário).
-   - **Proxy público:** é só clicar em **Iniciar**. O app baixa a lista, testa os proxies e abre o Discord com o
-     melhor em cerca de 15 a 30 segundos.
+   - **Proxy público:** é só clicar em **Iniciar**. O app conecta no servidor dedicado e abre o Discord em
+     poucos segundos. Se o servidor dedicado estiver fora do ar, ele baixa a lista, testa os proxies públicos e
+     abre o Discord com o melhor em cerca de 15 a 30 segundos.
 4. **Pronto.** O Discord abre pelo proxy. Deixe o app aberto (pode minimizar) — é ele quem vigia a conexão. Para
    voltar ao normal, clique em **Parar**.
 
 ## Telas
 
 <p align="center">
-  <img src="docs/images/telas.png" alt="Meu servidor: formulário preenchido e conectado. Proxy público: testando proxies e conectado.">
+  <img src="docs/images/telas.png" alt="Meu servidor: formulário preenchido e conectado. Proxy público: conectado ao servidor dedicado de pedrostyxx e, na reserva, a um proxy público dos EUA.">
 </p>
 
 <p align="center">
-  <img src="docs/images/outras-telas.png" alt="Proxy público em espera e trocando de proxy; Meu servidor conectando e mostrando um erro.">
+  <img src="docs/images/outras-telas.png" alt="Proxy público em espera, testando proxies e trocando para a reserva; Meu servidor mostrando um erro.">
 </p>
 
 ## Requisitos
@@ -124,8 +129,27 @@ Não. Uma VPN muda a rota de todo o computador. Aqui só o Discord usa o proxy; 
 <summary><b>O app guarda minha senha ou algum dado?</b></summary>
 <br>
 
-Não. Nada é gravado em disco: a senha SSH fica só na memória enquanto o app está aberto, e o app não cria
-configurações, serviços nem arquivos de dados.
+Não. Nada é gravado em disco (a não ser o log de diagnóstico, se você pedir um com `--log`; ele nunca contém
+senhas): a senha SSH fica só na memória enquanto o app está aberto, e o app não cria configurações, serviços nem
+arquivos de dados.
+</details>
+
+<details>
+<summary><b>O que é o servidor dedicado?</b></summary>
+<br>
+
+Um servidor oferecido gratuitamente por **[pedrostyxx](https://www.instagram.com/pedrostyxx/)** — se o app te
+ajudou, siga no Instagram como agradecimento. Ele fica fora do Brasil (na França), atrás da Cloudflare, e só
+atende este app e só o Discord: não serve para navegar, baixar ou acessar outros sites.
+
+Enquanto ele está em uso, o que não é do Discord (vídeos do YouTube e outras integrações, Spotify, as
+*Activities*, o envio de anexos, que vai para o Google) sai direto pela sua conexão, como sem o app. O servidor vê o
+seu IP e quais endereços do Discord são acessados, mas **não o conteúdo**, que continua criptografado. Ele não grava
+nada disso (o log dele só tem totais, sem IPs nem endereços). A conexão passa pela Cloudflare, que também vê o seu
+IP e o endereço do Discord acessado.
+
+Numa ligação, cada pessoa se conecta ao Discord pela própria internet: para que tudo funcione para todos, quem
+também estiver com o Discord bloqueado ou instável precisa estar com este app aberto.
 </details>
 
 <details>
@@ -142,7 +166,8 @@ consegue ver que você está usando o Discord. Para mais privacidade e estabilid
 <br>
 
 Para conseguir fechar e reabrir o Discord e túneis SSH antigos mesmo quando eles foram abertos com privilégio
-elevado. O Discord em si é sempre aberto como usuário comum, nunca como administrador.
+elevado. O Discord em si é sempre aberto como usuário comum, nunca como administrador: quem o abre é o próprio
+Explorer do Windows, como se você tivesse clicado no atalho.
 </details>
 
 <details>
@@ -150,6 +175,22 @@ elevado. O Discord em si é sempre aberto como usuário comum, nunca como admini
 <br>
 
 Nada a fazer: o app percebe em poucos segundos e reabre o Discord pelo proxy.
+</details>
+
+<details>
+<summary><b>O Discord não abre ou fica parado na tela de carregamento</b></summary>
+<br>
+
+Feche o app e abra-o de novo pelo PowerShell com a opção `--log` (ajuste o caminho para onde o `.exe` está):
+
+```powershell
+& "$env:USERPROFILE\Downloads\discord-proxy-launcher.exe" --log
+```
+
+Reproduza o problema e feche o app. Ele terá gravado `discord-proxy-launcher.log` na mesma pasta do `.exe` —
+anexe esse arquivo ao abrir uma [issue](https://github.com/pedrostyxx/discord-proxy-launcher/issues). O log
+nunca contém senhas. No modo **Meu servidor**, ele mostra o endereço e a porta do seu servidor (e, em algumas
+mensagens do ssh, o usuário): as issues são públicas, então troque-os por outro texto antes de anexar.
 </details>
 
 <details>
@@ -162,29 +203,38 @@ estiver disponível, um cliente SSH embutido.
 
 ## Segurança
 
-- **Nada vai para o disco** — nem senha, nem lista de proxies, nem log.
+- **Nada vai para o disco** — nem senha, nem lista de proxies, nem log (a não ser que você peça um log com
+  `--log`; mesmo nele, senhas nunca são registradas, mas o endereço do seu servidor aparece).
 - **O Discord nunca roda como administrador**, mesmo com o app elevado.
 - **A chave do servidor SSH é conferida** contra o seu `known_hosts`: se o servidor apresentar uma chave
   diferente da registrada, o app recusa a conexão antes de enviar a senha.
 - **Proxies públicos são testados de verdade:** só entram na fila os que entregam uma resposta HTTPS válida do
-  Discord, com o certificado conferido.
+  Discord, com o certificado conferido — e que saem fora do Brasil.
+- **O servidor dedicado só serve para o Discord:** ele confere o destino de cada conexão e o nome dentro da própria
+  conexão criptografada do Discord, e recusa todo o resto (detalhes em [server/README.md](server/README.md)).
 
 ## Limitações
 
 - **Sem assinatura digital.** O Windows mostra o aviso do SmartScreen na primeira execução
   (*Mais informações → Executar assim mesmo*). Em PCs com o **Controle Inteligente de Aplicativos** (Smart App
   Control) ligado, o Windows pode bloquear o executável.
-- **Proxies gratuitos são instáveis:** podem ser lentos e cair a qualquer momento. O app troca sozinho, mas cada
-  troca fecha e reabre o Discord por alguns segundos.
-- **IP nas chamadas:** voz, vídeo e compartilhamento de tela não passam pelo proxy (veja acima).
+- **Proxies gratuitos são instáveis:** podem ser lentos e cair a qualquer momento. O app troca sozinho e sem
+  fechar o Discord, mas uma imagem ou mensagem pode demorar um pouco no instante da troca.
+- **O que sai com o seu IP:** voz, vídeo e compartilhamento de tela nunca passam pelo proxy; com o servidor
+  dedicado, também o envio de anexos, as *Activities* e as integrações (veja acima).
+- **Distância do servidor dedicado:** ele fica na França, então mensagens e imagens levam cerca de 0,2 s a mais
+  para quem está no Brasil. Numa ligação iniciada por quem usa o app, o Discord pode escolher um servidor de voz
+  na Europa; se a voz ficar atrasada, mude a região da chamada (ou do canal de voz) para **Brasil**.
 
 ## Para desenvolvedores
 
-O app é feito em Python 3.12 com tkinter e compilado com PyInstaller em um `.exe` único.
+O app é feito em Python 3.12 com tkinter e compilado com PyInstaller em um `.exe` único. O build oficial embute o
+`dconnect.json` (endereço e token do servidor dedicado), que não fica no repositório — veja
+[server/README.md](server/README.md). Sem ele, compile com `-NoDedicated`: o `.exe` usa só as listas públicas.
 
 ```powershell
 # compilar: cria o .venv, instala as dependências e gera dist\discord-proxy-launcher.exe
-powershell -ExecutionPolicy Bypass -File build.ps1
+powershell -ExecutionPolicy Bypass -File build.ps1 -NoDedicated
 
 # rodar os testes
 .\.venv\Scripts\python.exe -m unittest discover -s tests

@@ -5,12 +5,14 @@ callbacks: on_status(cor, texto) e on_finish().
 """
 from __future__ import annotations
 
+import dataclasses
+import random
 import socket
 import threading
 import time
 from typing import Callable
 
-from . import config, discord, proxies, socks5, tunnel, win
+from . import config, dconnect, discord, proxies, relay, socks5, tunnel, win
 from .log import log
 
 # Cores da linha de status
@@ -39,10 +41,13 @@ class Session(threading.Thread):
         on_status: Callable[[str, str], None],
         on_finish: Callable[[], None],
         find_install: Callable[[], discord.DiscordInstall | None] = discord.find_install,
+        on_notice: Callable[[str | None], None] = lambda kind: None,
     ):
         super().__init__(name="session", daemon=True)
         self._on_status = on_status
         self._on_finish = on_finish
+        self._on_notice = on_notice
+        self._notice: str | None = None
         self._find_install = find_install
         self._stop_event = threading.Event()
         self._install: discord.DiscordInstall | None = None
@@ -78,13 +83,25 @@ class Session(threading.Thread):
         raise NotImplementedError
 
     def _active_proxy(self) -> tuple[str, int]:
+        """O proxy que a verificação de saúde testa."""
         raise NotImplementedError
+
+    def _discord_proxy(self) -> tuple[str, int]:
+        """O endereço que vai na flag `--proxy-server` do Discord."""
+        return self._active_proxy()
 
     def _active_text(self, latency_ms: float) -> str:
         raise NotImplementedError
 
     def _backend_alive(self) -> bool:
         return True
+
+    def _backend_failing(self) -> bool:
+        """True se o próprio uso já mostrou que o proxy ativo deve ser trocado."""
+        return False
+
+    def _periodic(self) -> None:
+        """Chamado a cada segundo pelo monitor (o modo Proxy público tenta voltar ao servidor dedicado)."""
 
     def _backend_address(self) -> tuple[str, int] | None:
         """Endereço na internet do qual a sessão depende (servidor SSH ou proxy)."""
@@ -128,6 +145,7 @@ class Session(threading.Thread):
             self._status(RED, f"Erro: {error}" + (" — Discord fechado" if closed_discord else ""))
         else:
             self._status(WHITE, "Desconectado")
+        self._set_notice(self._final_notice())
         self._on_finish()
 
     def _status(self, color: str, text: str) -> None:
@@ -136,6 +154,16 @@ class Session(threading.Thread):
 
     def _show_active(self, latency_ms: float) -> None:
         self._status(GREEN, self._active_text(latency_ms))
+
+    def _final_notice(self) -> str | None:
+        """O aviso que fica na tela depois que a sessão termina."""
+        return None
+
+    def _set_notice(self, kind: str | None) -> None:
+        """Aviso da interface (o painel do servidor dedicado); só avisa quando muda."""
+        if kind != self._notice:
+            self._notice = kind
+            self._on_notice(kind)
 
     def _check_stop(self) -> None:
         if self._stop_event.is_set():
@@ -189,7 +217,7 @@ class Session(threading.Thread):
         processo cuja linha de comando não dá para ler conta, na dúvida, como
         principal sem o proxy.
         """
-        flag = discord.proxy_argument(*self._active_proxy())
+        flag = discord.proxy_argument(*self._discord_proxy())
         proxied, unproxied = None, False
         for pid in pids:
             command_line = win.process_command_line(pid)
@@ -234,7 +262,7 @@ class Session(threading.Thread):
             raise SessionError("o Discord insiste em reiniciar sem o proxy")
         self._reopen_times.append(now)
         self._status(ORANGE, "O Discord reiniciou sem o proxy — reabrindo...")
-        self._restart_discord(*self._active_proxy())
+        self._restart_discord(*self._discord_proxy())
         self._show_active(self._last_latency)
 
     # -- monitor de saúde --
@@ -252,11 +280,15 @@ class Session(threading.Thread):
             latency = socks5.probe(proxy, config.HEALTH_TARGET, config.HEALTH_TIMEOUT)
         except OSError as probe_error:
             try:
-                latency = proxies.discord_check(proxy, config.HEALTH_TIMEOUT).total_ms
+                latency = self._discord_responds(proxy)
             except OSError:
                 raise probe_error from None
         self._last_latency = latency
         return latency
+
+    def _discord_responds(self, proxy: tuple[str, int]) -> float:
+        """Segunda camada da verificação: o Discord responde por este proxy? (latência em ms)"""
+        return proxies.discord_check(proxy, config.HEALTH_TIMEOUT).total_ms
 
     def _monitor(self) -> None:
         failures = 0
@@ -267,6 +299,15 @@ class Session(threading.Thread):
             ticks += 1
             if ticks % 3 == 0:
                 self._watch_discord()
+            if self._backend_failing():
+                # As conexões do Discord já mostraram o problema. Não há por que esperar
+                # duas verificações (mas antes confere se não é a rede local que caiu).
+                log.info("o proxy ativo vem falhando nas conexões do Discord")
+                self._handle_outage()
+                failures = 0
+                next_check = time.monotonic() + config.HEALTH_INTERVAL
+                continue
+            self._periodic()
             if not self._backend_alive():
                 # O túnel caiu de vez: não há por que esperar duas verificações.
                 log.info("o túnel não está mais ativo")
@@ -457,6 +498,10 @@ class SshSession(Session):
     def _active_proxy(self) -> tuple[str, int]:
         return (config.LOCAL_SOCKS_HOST, self._tunnel.local_port)
 
+    def _discord_responds(self, proxy: tuple[str, int]) -> float:
+        # O servidor é do próprio usuário: a regra de sair fora do Brasil é só do modo Proxy público.
+        return proxies.discord_check(proxy, config.HEALTH_TIMEOUT, reject_countries=frozenset()).total_ms
+
     def _active_text(self, latency_ms: float) -> str:
         return f"Proxy ativo — {self._tunnel.label} ({latency_ms:.0f}ms)"
 
@@ -472,35 +517,273 @@ class SshSession(Session):
 
 
 class PublicSession(Session):
-    """Modo B — Proxy público: lista gratuita, testada e trocada automaticamente."""
+    """Modo B — Proxy público.
 
-    def __init__(self, **kwargs):
+    Primeiro o servidor dedicado (o dconnect, oferecido por pedrostyxx), se este
+    build tiver um; as listas públicas de proxies SOCKS5 ficam de reserva. O
+    Discord aponta para o proxy local (relay.py) a sessão inteira: trocar entre o
+    servidor dedicado e os proxies públicos não exige fechar e reabrir o Discord.
+    """
+
+    def __init__(self, dedicated: dconnect.DedicatedServer | None = None, **kwargs):
         super().__init__(**kwargs)
         self._pool = proxies.ProxyPool()
         self._active: proxies.Approved | None = None
+        self._relay: relay.ProxyRelay | None = None
+        self._vps = dedicated
+        # Servidor dedicado: absent (este build não tem), unknown, ok, down (tenta
+        # de novo em _vps_next_try) ou rejected (não aceita mais esta versão do app).
+        self._vps_state = "absent" if dedicated is None else "unknown"
+        self._vps_next_try = 0.0
+        self._vps_backoff = config.VPS_RETRY_INITIAL
+        self._vps_since = float("-inf")         # desde quando está nele (para zerar o recuo)
+        self._vps_returned_at = float("-inf")   # quando voltou para ele (para notar uma recaída)
+        self._vps_confirmed_at: float | None = None
+        self._vps_skip_grace = False
+        self._vps_suspects: list[float] = []
+
+    # -- início --
 
     def _connect(self) -> None:
         self._status(BLUE, "Conectando...")
-        entry = self._next_proxy(YELLOW, "Testando proxies...")
+        entry = self._vps_at_start() if self._vps is not None else None
+        if entry is None:
+            entry = self._next_proxy(YELLOW, "Testando proxies...")
+        self._relay = self._open_relay()
         self._use(entry)
+        self._restart_discord(*self._discord_proxy())
         self._show_active(entry.connect_ms)
+        self._update_notice()
+
+    def _open_relay(self) -> relay.ProxyRelay:
+        error: OSError | None = None
+        for _ in range(3):              # a porta escolhida pode ser ocupada por outro programa nesse meio-tempo
+            try:
+                return relay.ProxyRelay(tunnel.pick_local_port(), self._pool, self._vps)
+            except OSError as exc:
+                error = exc
+        raise SessionError(f"não foi possível abrir o proxy local ({error})")
+
+    # -- servidor dedicado --
+
+    def _vps_at_start(self) -> proxies.Approved | None:
+        self._status(BLUE, "Conectando ao servidor dedicado...")
+        for attempt in range(2):
+            try:
+                entry = self._vps_check()
+            except dconnect.TokenRejected as exc:
+                self._vps_reject(exc)
+                self._status(YELLOW, "O servidor dedicado não aceita esta versão do app — usando proxies públicos...")
+                return None
+            except OSError as exc:
+                log.info("servidor dedicado indisponível no início: %s", exc)
+                self._check_stop()
+                if attempt == 0 and self._offline():
+                    self._wait_for_internet()
+                    continue
+                break
+            else:
+                self._vps_state = "ok"
+                self._vps_since = time.monotonic()
+                return entry
+        self._vps_mark_down()
+        self._status(YELLOW, "Servidor dedicado indisponível — usando proxies públicos...")
+        return None
+
+    def _vps_check(self) -> proxies.Approved:
+        """Verificação completa: o servidor responde, abre túnel e o Discord atende por ele."""
+        assert self._vps is not None
+        result = dconnect.check(self._vps)
+        if result.country in config.BLOCKED_EXIT_COUNTRIES:
+            raise dconnect.ServerUnavailable(f"o servidor dedicado sai pelo país {result.country}")
+        return proxies.Approved(
+            result.latency_ms, (self._vps.host, self._vps.port), result.latency_ms, time.monotonic(),
+            result.country, dedicated=True,
+        )
+
+    def _vps_reject(self, reason) -> None:
+        if self._vps_state != "rejected":
+            log.warning("o servidor dedicado não aceita esta versão do app: %s", reason)
+        self._vps_state = "rejected"
+        self._update_notice()
+
+    def _vps_mark_down(self) -> None:
+        if self._vps_state == "rejected":
+            return                          # recusado é definitivo nesta sessão
+        now = time.monotonic()
+        if now - self._vps_returned_at < config.VPS_RELAPSE_WINDOW:
+            # Voltou para ele e caiu de novo logo: espera mais antes da próxima tentativa.
+            self._vps_backoff = min(self._vps_backoff * 2, config.VPS_RETRY_MAX)
+        self._vps_state = "down"
+        self._vps_confirmed_at = None
+        self._vps_next_try = now + self._vps_backoff * random.uniform(0.9, 1.1)
+
+    def _vps_due(self) -> bool:
+        return self._vps_state == "down" and time.monotonic() >= self._vps_next_try
+
+    def _vps_if_due(self, confirm: bool) -> proxies.Approved | None:
+        """Tenta o servidor dedicado se chegou a hora; devolve a entrada se ele voltou.
+
+        Com `confirm`, só volta depois de duas verificações boas, separadas por
+        VPS_RETURN_CONFIRM: trocar de saída sem necessidade também atrapalha.
+        """
+        if not self._vps_due():
+            return None
+        try:
+            entry = self._vps_check()
+        except dconnect.TokenRejected as exc:
+            self._vps_reject(exc)
+            return None
+        except OSError as exc:
+            log.info("servidor dedicado ainda indisponível: %s", exc)
+            self._vps_backoff = min(self._vps_backoff * 2, config.VPS_RETRY_MAX)
+            self._vps_confirmed_at = None
+            self._vps_next_try = time.monotonic() + self._vps_backoff * random.uniform(0.9, 1.1)
+            return None
+        if confirm and self._vps_confirmed_at is None:
+            self._vps_confirmed_at = time.monotonic()
+            self._vps_next_try = self._vps_confirmed_at + config.VPS_RETURN_CONFIRM
+            log.info("servidor dedicado respondeu; confirmando antes de voltar para ele")
+            return None
+        self._vps_confirmed_at = None
+        self._vps_state = "ok"
+        self._vps_since = self._vps_returned_at = time.monotonic()
+        return entry
+
+    def _vps_grace(self) -> bool:
+        """Um reinício rápido do servidor (atualização, reboot) não manda todo mundo para a lista."""
+        assert self._vps is not None
+        self._status(ORANGE, "Servidor dedicado instável — tentando reconectar...")
+        for delay in config.VPS_GRACE_DELAYS:
+            self._sleep(delay)
+            try:
+                result = dconnect.health(self._vps)
+            except dconnect.TokenRejected as exc:
+                self._vps_reject(exc)
+                return False
+            except OSError:
+                continue
+            self._last_latency = result.latency_ms
+            if self._relay is not None and self._active is not None:
+                self._relay.set_active(self._active)            # zera os contadores de falha
+            self._show_active(result.latency_ms)
+            return True
+        return False
+
+    def _update_notice(self) -> None:
+        if self._vps_state == "rejected":
+            self._set_notice("vps_update")
+        elif self._active is not None and self._active.dedicated and self._vps_state == "ok":
+            self._set_notice("vps")
+        else:
+            self._set_notice(None)
+
+    def _final_notice(self) -> str | None:
+        # "Atualize o app" continua valendo depois do fim da sessão (o motivo de um erro pode ser ele).
+        return "vps_update" if self._vps_state == "rejected" else None
+
+    def _periodic(self) -> None:
+        """Usando um proxy público, volta para o servidor dedicado quando ele voltar."""
+        if self._relay is None or self._active is None:
+            return
+        if self._active.dedicated:
+            if (self._vps_backoff != config.VPS_RETRY_INITIAL
+                    and time.monotonic() - self._vps_since > config.VPS_STABLE_AFTER):
+                self._vps_backoff = config.VPS_RETRY_INITIAL      # firme no servidor: zera o recuo
+            return
+        entry = self._vps_if_due(confirm=True)
+        if entry is None:
+            return
+        self._pool.put_back(dataclasses.replace(self._active, tested_at=time.monotonic()))
+        self._use(entry)
+        self._status(GREEN, f"Reconectado via {entry.label}")
+        self._update_notice()
+
+    # -- monitor --
+
+    def _health(self) -> float:
+        if self._active is not None and self._active.dedicated:
+            assert self._vps is not None
+            try:
+                result = dconnect.health(self._vps)
+            except dconnect.TokenRejected as exc:
+                self._vps_reject(exc)
+                raise
+            self._last_latency = result.latency_ms
+            return result.latency_ms
+        return super()._health()
+
+    def _backend_failing(self) -> bool:
+        if self._relay is None or self._active is None:
+            return False
+        events = self._relay.take_events()
+        if events.vps_rejected:
+            self._vps_reject(events.vps_rejected)
+        if self._active.dedicated:
+            if self._vps_state == "rejected":
+                return True
+            if events.vps_refusing:
+                # Ele responde, mas não atende este usuário (cota, limites): ficar nele
+                # deixaria o Discord sem conexão com "Proxy ativo" na tela.
+                log.info("o servidor dedicado vem recusando as conexões do Discord")
+                self._vps_skip_grace = True
+                return True
+            if events.vps_suspect:
+                now = time.monotonic()
+                self._vps_suspects = [moment for moment in self._vps_suspects if now - moment < 300] + [now]
+                if len(self._vps_suspects) >= 3:
+                    # O /health diz que está tudo bem, mas as conexões seguem falhando.
+                    self._vps_skip_grace = True
+                    return True
+                # As conexões do Discord falharam; o servidor ainda responde?
+                try:
+                    dconnect.health(self._vps)
+                except dconnect.TokenRejected as exc:
+                    self._vps_reject(exc)
+                    return True
+                except OSError:
+                    return True
+                log.info("o servidor dedicado responde; as falhas eram passageiras")
+            return False
+        return events.active_failing
 
     def _recover(self) -> None:
-        self._status(ORANGE, "Instabilidade detectada — trocando proxy...")
-        if self._active is not None:
-            self._pool.mark_failed(self._active.proxy)
+        on_vps = self._active is not None and self._active.dedicated
+        if on_vps and self._vps_state != "rejected":
+            skip_grace, self._vps_skip_grace = self._vps_skip_grace, False
+            if not skip_grace and self._vps_grace():
+                return
+        if on_vps and self._vps_state == "rejected":
+            self._status(ORANGE, "O servidor dedicado não aceita mais esta versão do app — usando proxies públicos...")
+        elif on_vps:
+            self._status(ORANGE, "Servidor dedicado instável — trocando para proxies públicos...")
+            self._vps_mark_down()
+            self._update_notice()           # o painel do servidor dedicado sai na hora
+        else:
+            self._status(ORANGE, "Instabilidade detectada — trocando proxy...")
+            if self._active is not None:
+                self._pool.mark_failed(self._active.proxy)
+        if self._relay is not None:
+            # Enquanto o próximo é escolhido, as conexões do Discord vão para a reserva.
+            self._relay.demote_active()
         entry = self._next_proxy(ORANGE, "Instabilidade — trocando proxy...")
         self._use(entry)
-        self._status(GREEN, f"Reconectado via {entry.address}")
+        self._status(GREEN, f"Reconectado via {entry.label}")
+        self._update_notice()
 
     def _use(self, entry: proxies.Approved) -> None:
         self._active = entry
         self._last_latency = entry.connect_ms
-        self._restart_discord(*entry.proxy)
+        if entry.dedicated:
+            self._vps_suspects = []
+        if self._relay is not None:
+            self._relay.set_active(entry)
+
+    # -- proxies públicos --
 
     def _next_proxy(self, color: str, prefix: str) -> proxies.Approved:
-        """O melhor proxy disponível: primeiro a reserva, depois o resto da lista,
-        depois uma lista nova."""
+        """O melhor caminho disponível: o servidor dedicado se for hora de tentá-lo,
+        depois a reserva, o resto da lista e, por fim, uma lista nova."""
 
         def progress(tested: int, total: int, approved: int) -> None:
             plural = "" if approved == 1 else "s"
@@ -508,12 +791,15 @@ class PublicSession(Session):
 
         while True:
             self._check_stop()
+            entry = self._vps_if_due(confirm=False)
+            if entry is not None:
+                return entry
             entry = self._pool.pop_best()
             if entry is not None:
                 if time.monotonic() - entry.tested_at <= config.STANDBY_FRESH_FOR:
                     return entry
                 # Proxy gratuito cai a toda hora: confirma que a reserva ainda
-                # funciona antes de fechar o Discord por causa dela.
+                # funciona antes de usá-la.
                 try:
                     result = proxies.discord_check(entry.proxy)
                 except OSError:
@@ -523,13 +809,17 @@ class PublicSession(Session):
                     else:
                         self._pool.mark_failed(entry.proxy)
                     continue
-                return proxies.Approved(result.total_ms, entry.proxy, result.connect_ms, time.monotonic())
+                return proxies.Approved(result.total_ms, entry.proxy, result.connect_ms, time.monotonic(),
+                                        getattr(result, "country", ""))
             if not self._pool.has_untested():
                 self._refill()
+                if not self._pool.has_untested():
+                    continue                            # o servidor dedicado ficou na vez
             self._pool.test_until(
                 config.TEST_ENOUGH_APPROVED, self._stop_event, progress,
                 is_offline=self._offline,
                 on_offline=lambda: self._status(ORANGE, _OFFLINE_TEXT),
+                should_stop=self._vps_due,
             )
 
     def _refill(self) -> None:
@@ -543,24 +833,44 @@ class PublicSession(Session):
                 if loaded:
                     return
             self._check_stop()
-            if downloaded:
+            # No meio da sessão, com o servidor dedicado fora do ar, não desiste:
+            # ele pode voltar (e é ele que funciona nas redes que bloqueiam as listas).
+            waiting_for_vps = self._active is not None and self._vps_state == "down"
+            if downloaded and not waiting_for_vps:
                 raise SessionError("nenhum proxy público funcionando no momento — tente mais tarde")
-            if self._active is None:
+            if not downloaded and self._active is None:
                 # Logo no início, com o usuário olhando: melhor avisar do que esperar.
+                if self._vps_state == "down":
+                    raise SessionError("o servidor dedicado está indisponível e não foi possível baixar "
+                                       "a lista de proxies (sem internet?)")
                 raise SessionError("não foi possível baixar a lista de proxies (sem internet?)")
-            # No meio de uma sessão, nenhuma fonte responder quer dizer que a rede
-            # caiu. Os proxies "reprovados" nesse intervalo não tinham culpa.
-            self._pool.forget_failures()
-            self._status(ORANGE, _OFFLINE_TEXT)
+            if not downloaded:
+                # No meio de uma sessão, nenhuma fonte responder costuma ser a rede que caiu.
+                # Os proxies "reprovados" nesse intervalo não tinham culpa.
+                self._pool.forget_failures()
+            if waiting_for_vps and not self._offline():
+                self._status(ORANGE, "Servidor dedicado e proxies públicos indisponíveis — tentando de novo...")
+            else:
+                self._status(ORANGE, _OFFLINE_TEXT)
             self._sleep(_REFILL_RETRY)
+            if self._vps_due():
+                return                                  # _next_proxy tenta o servidor dedicado
 
     def _active_proxy(self) -> tuple[str, int]:
         assert self._active is not None
         return self._active.proxy
 
+    def _discord_proxy(self) -> tuple[str, int]:
+        assert self._relay is not None
+        return (config.LOCAL_SOCKS_HOST, self._relay.port)
+
     def _active_text(self, latency_ms: float) -> str:
         assert self._active is not None
-        return f"Proxy ativo — {self._active.address} ({latency_ms:.0f}ms)"
+        return f"Proxy ativo — {self._active.label} ({latency_ms:.0f}ms)"
 
     def _backend_address(self) -> tuple[str, int] | None:
         return self._active.proxy if self._active is not None else None
+
+    def _cleanup(self) -> None:
+        if self._relay is not None:
+            self._relay.close()

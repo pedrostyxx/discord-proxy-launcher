@@ -30,6 +30,31 @@ _DISCORD_REQUEST = (
     "Accept: application/json\r\n"
     "Connection: close\r\n\r\n"
 ).encode("ascii")
+# A Cloudflare, que atende o gateway do Discord, informa o país de quem pergunta
+# (loc=XX) em /cdn-cgi/trace. É o jeito de saber por onde o proxy sai — e não
+# conta nos limites da API do Discord.
+TRACE_HOST = "gateway.discord.gg"
+TRACE_REQUEST = (
+    "GET /cdn-cgi/trace HTTP/1.1\r\n"
+    f"Host: {TRACE_HOST}\r\n"
+    f"User-Agent: {_USER_AGENT}\r\n"
+    "Connection: close\r\n\r\n"
+).encode("ascii")
+
+
+FALLBACK_TRACE_HOST = "www.cloudflare.com"      # só para proxies públicos, se o do Discord falhar
+FALLBACK_TRACE_REQUEST = TRACE_REQUEST.replace(TRACE_HOST.encode(), FALLBACK_TRACE_HOST.encode())
+_LOC = re.compile(rb"(?:^|\n)loc=([A-Za-z]{2})\s")
+
+
+def parse_trace(answer: bytes) -> tuple[int | str, str]:
+    """(status HTTP, país) de uma resposta de /cdn-cgi/trace (ou só o status, de outra resposta)."""
+    status_line = answer.split(b"\r\n", 1)[0].split()
+    status: int | str = "?"
+    if len(status_line) >= 2 and status_line[0].startswith(b"HTTP/") and status_line[1].isdigit():
+        status = int(status_line[1])
+    match = _LOC.search(answer)
+    return status, match.group(1).decode("ascii").upper() if match else ""
 
 
 @functools.lru_cache(maxsize=1)
@@ -102,43 +127,85 @@ _REMOTE_ANSWERED = (
 class CheckResult(NamedTuple):
     connect_ms: float   # tempo até o proxy completar o TCP com o destino
     total_ms: float     # tempo até a resposta HTTP chegar
+    country: str = ""   # país de saída do proxy (vazio se desconhecido)
 
 
-def discord_check(proxy: Proxy, timeout: float = config.TEST_TIMEOUT) -> CheckResult:
-    """Confere se o Discord funciona de verdade através do proxy.
-
-    Abrir a porta do proxy não basta: muitos proxies gratuitos aceitam a conexão
-    e não entregam nada, ou têm o IP barrado pelo Discord. Por isso o teste faz
-    uma requisição HTTPS real (certificado verificado) à API pública do Discord
-    e só aprova com HTTP 200. Lança OSError se o proxy não servir.
-    """
-    started = time.perf_counter()       # relógio de alta resolução para a latência
-    deadline = time.monotonic() + timeout
-    sock = socks5.connect(proxy, _DISCORD_HOST, 443, deadline=deadline)
+def _https_get(proxy: Proxy, host: str, request: bytes, deadline: float, until=None) -> tuple[bytes, float]:
+    """(resposta, ms até o proxy conectar ao destino). Lê até `until(resposta)`, o fim ou 64 KB."""
+    started = time.perf_counter()
+    sock = socks5.connect(proxy, host, 443, deadline=deadline)
     connect_ms = (time.perf_counter() - started) * 1000.0
     try:
         sock.settimeout(socks5.time_left(deadline))
-        tls = tls_context().wrap_socket(sock, server_hostname=_DISCORD_HOST)
+        tls = tls_context().wrap_socket(sock, server_hostname=host)
     except BaseException:
         sock.close()
         raise
     try:
         tls.settimeout(socks5.time_left(deadline))
-        tls.sendall(_DISCORD_REQUEST)
-        head = b""
-        while b"\r\n" not in head and len(head) < 1024:
+        tls.sendall(request)
+        answer = b""
+        while len(answer) < 65536:
             tls.settimeout(socks5.time_left(deadline))
-            chunk = tls.recv(1024)
+            chunk = tls.recv(4096)
             if not chunk:
                 break
-            head += chunk
+            answer += chunk
+            if until is not None and until(answer):
+                break
+        return answer, connect_ms
     finally:
         tls.close()
-    status = head.split(b"\r\n", 1)[0].split()
-    if len(status) < 2 or not status[0].startswith(b"HTTP/") or status[1] != b"200":
-        code = status[1].decode("ascii", "replace") if len(status) > 1 else "?"
-        raise socks5.ProxyError(f"discord.com respondeu {code}")
-    return CheckResult(connect_ms, (time.perf_counter() - started) * 1000.0)
+
+
+def _trace_done(answer: bytes) -> bool:
+    if _LOC.search(answer):
+        return True
+    return b"\r\n\r\n" in answer and not answer.startswith(b"HTTP/1.1 200")
+
+
+def exit_country(proxy: Proxy, deadline: float) -> str:
+    """Por qual país o proxy sai, segundo a Cloudflare ("" se não deu para saber)."""
+    for host, request in ((TRACE_HOST, TRACE_REQUEST), (FALLBACK_TRACE_HOST, FALLBACK_TRACE_REQUEST)):
+        try:
+            answer, _ = _https_get(proxy, host, request, deadline, until=_trace_done)
+        except OSError:
+            continue
+        status, country = parse_trace(answer)
+        if status == 200 and country:
+            return country
+    return ""
+
+
+def discord_check(proxy: Proxy, timeout: float = config.TEST_TIMEOUT,
+                  reject_countries: frozenset | None = None) -> CheckResult:
+    """Confere se o Discord funciona de verdade através do proxy, e por qual país ele sai.
+
+    Abrir a porta do proxy não basta: muitos proxies gratuitos aceitam a conexão
+    e não entregam nada, ou têm o IP barrado pelo Discord. Por isso o teste faz
+    uma requisição HTTPS real (certificado verificado) à API do Discord e só
+    aprova com HTTP 200. Depois descobre o país de saída: proxies que saem por um
+    país de `reject_countries` (por padrão BLOCKED_EXIT_COUNTRIES, o Brasil) — ou
+    cujo país não dá para saber — são recusados: o objetivo do modo Proxy público
+    é sair fora dele. Lança OSError se o proxy não servir.
+    """
+    if reject_countries is None:
+        reject_countries = config.BLOCKED_EXIT_COUNTRIES
+    started = time.perf_counter()       # relógio de alta resolução para a latência
+    answer, connect_ms = _https_get(proxy, _DISCORD_HOST, _DISCORD_REQUEST, time.monotonic() + timeout,
+                                    until=lambda data: b"\r\n" in data)
+    total_ms = (time.perf_counter() - started) * 1000.0
+    status, _ = parse_trace(answer)
+    if status != 200:
+        raise socks5.ProxyError(f"discord.com respondeu {status}")
+    country = ""
+    if reject_countries:
+        country = exit_country(proxy, time.monotonic() + config.TRACE_TIMEOUT)
+        if not country:
+            raise socks5.ProxyError("não deu para saber por qual país o proxy sai")
+        if country in reject_countries:
+            raise socks5.ProxyError(f"o proxy sai pelo país {country}")
+    return CheckResult(connect_ms, total_ms, country)
 
 
 # --- Fila de proxies ---------------------------------------------------------
@@ -149,10 +216,19 @@ class Approved:
     proxy: Proxy = field(compare=False)
     connect_ms: float = field(compare=False)
     tested_at: float = field(compare=False)
+    country: str = field(default="", compare=False)     # país de saída, se conhecido
+    dedicated: bool = field(default=False, compare=False)
 
     @property
     def address(self) -> str:
         return f"{self.proxy[0]}:{self.proxy[1]}"
+
+    @property
+    def label(self) -> str:
+        """Como o proxy aparece na linha de status."""
+        name = f"servidor dedicado de {config.DEDICATED_OWNER}" if self.dedicated else self.address
+        country = config.country_name(self.country)
+        return f"{name} · {country}" if country else name
 
 
 class ProxyPool:
@@ -202,6 +278,11 @@ class ProxyPool:
         with self._lock:
             return self._approved.pop(0) if self._approved else None
 
+    def peek(self, count: int) -> list[Approved]:
+        """Os `count` aprovados de menor latência, sem tirá-los da fila."""
+        with self._lock:
+            return list(self._approved[:count])
+
     def mark_failed(self, proxy: Proxy) -> None:
         """Um proxy que caiu em uso não volta para a fila tão cedo."""
         with self._lock:
@@ -225,12 +306,16 @@ class ProxyPool:
         on_progress: Callable[[int, int, int], None] | None = None,
         is_offline: Callable[[float], bool] | None = None,
         on_offline: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         """Testa os pendentes, no máximo TEST_CONCURRENCY por vez.
 
         Retorna quando houver `enough` aprovados (None = testar a lista toda),
         quando a lista acabar ou quando `stop` for acionado. `on_progress`
         recebe (testados, total, aprovados).
+
+        `should_stop()` interrompe o teste antes (por exemplo, quando chegou a hora
+        de tentar o servidor dedicado de novo).
 
         `is_offline(instante_da_falha)` diz se a rede local caiu. Nesse caso os
         testes falham por culpa nossa, não dos proxies: eles voltam para a fila
@@ -253,6 +338,8 @@ class ProxyPool:
         with self._lock:
             while not stop.is_set():
                 if enough is not None and len(self._approved) >= enough:
+                    break
+                if should_stop is not None and should_stop():
                     break
                 if not self._untested and self._inflight == 0:
                     break
@@ -310,7 +397,7 @@ class ProxyPool:
                 if result is not None:
                     bisect.insort(
                         self._approved,
-                        Approved(result.total_ms, proxy, result.connect_ms, now),
+                        Approved(result.total_ms, proxy, result.connect_ms, now, getattr(result, "country", "")),
                     )
                 # Dentro do lock: garante que nenhum progresso atrasado chegue
                 # depois que test_until() já retornou.

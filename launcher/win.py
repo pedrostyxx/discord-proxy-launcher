@@ -404,6 +404,11 @@ def kill_pid(pid: int, wait_ms: int = 2000) -> bool:
 def process_command_line(pid: int) -> str | None:
     """Linha de comando com que o processo foi iniciado (None se não der para ler)."""
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle and ctypes.get_last_error() == ERROR_ACCESS_DENIED and desktop_user().other_account \
+            and _enable_privilege("SeDebugPrivilege"):
+        # Elevado com outra conta: os processos do usuário da área de trabalho só
+        # se deixam consultar com o privilégio de depuração (como em kill_pid).
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
     try:
@@ -1023,6 +1028,347 @@ def spawn_with_limited_token(executable: str, arguments: list[str]) -> int:
         user_dacl.close()
 
 
+# --- Abrir pelo próprio Explorer --------------------------------------------------
+#
+# O jeito documentado de um programa elevado abrir outro como o usuário comum é
+# pedir ao Explorer que o abra. Aí quem cria o processo é o Explorer: token,
+# ambiente, permissões e o resto saem dele, exatamente como em um clique no atalho.
+# Os outros dois jeitos (iniciar como "filho" do Explorer ou com o token rebaixado)
+# criam o processo a partir do launcher elevado, e detalhes que vêm de quem cria
+# o processo já fizeram o Discord travar ao abrir. Por isso eles viraram reserva.
+#
+# Caminho: IShellWindows → janela da área de trabalho → IShellBrowser →
+# IShellView → IShellFolderViewDual → IShellDispatch2::ShellExecute.
+
+CLSCTX_LOCAL_SERVER = 0x4
+COINIT_APARTMENTTHREADED = 0x2
+VT_I4 = 3
+VT_BSTR = 8
+CSIDL_DESKTOP = 0
+SWC_DESKTOP = 8
+SWFO_NEEDDISPATCH = 1
+SVGIO_BACKGROUND = 0
+SW_SHOWNORMAL = 1
+_EXPLORER_TIMEOUT = 15.0                # para o Explorer atender e o processo novo aparecer
+
+CLSID_SHELL_WINDOWS = GUID.parse("9BA05972-F6A8-11CF-A442-00A0C90A8F39")
+IID_ISHELL_WINDOWS = GUID.parse("85CB6900-4D95-11CF-960C-0080C7F4EE85")
+IID_ISERVICE_PROVIDER = GUID.parse("6D5140C1-7436-11CE-8034-00AA006009FA")
+SID_STOP_LEVEL_BROWSER = GUID.parse("4C96BE40-915C-11CF-99D3-00AA004AE837")
+IID_ISHELL_BROWSER = GUID.parse("000214E2-0000-0000-C000-000000000046")
+IID_IDISPATCH = GUID.parse("00020400-0000-0000-C000-000000000046")
+IID_ISHELL_FOLDER_VIEW_DUAL = GUID.parse("E7A1AF80-4D96-11CF-960C-0080C7F4EE85")
+IID_ISHELL_DISPATCH2 = GUID.parse("A4C6892C-3BA9-11D2-9DEA-00C04FB16162")
+
+# Posição de cada método na tabela da interface (IUnknown ocupa 0-2 e IDispatch, 3-6).
+_QUERY_INTERFACE, _RELEASE = 0, 2
+_SHELL_WINDOWS_FIND_WINDOW_SW = 15
+_SERVICE_PROVIDER_QUERY_SERVICE = 3
+_SHELL_BROWSER_QUERY_ACTIVE_SHELL_VIEW = 15
+_SHELL_VIEW_GET_ITEM_OBJECT = 15
+_FOLDER_VIEW_DUAL_GET_APPLICATION = 7
+_SHELL_DISPATCH2_SHELL_EXECUTE = 31
+
+oleaut32 = _system_dll("oleaut32")
+
+
+class VARIANT(ctypes.Structure):
+    class _Value(ctypes.Union):
+        _fields_ = [
+            ("lVal", ctypes.c_long),
+            ("bstrVal", LPVOID),
+            ("_size", ctypes.c_byte * (2 * ctypes.sizeof(LPVOID))),     # 16 bytes no Windows 64 bits
+        ]
+
+    _fields_ = [
+        ("vt", wintypes.USHORT),
+        ("wReserved1", wintypes.USHORT),
+        ("wReserved2", wintypes.USHORT),
+        ("wReserved3", wintypes.USHORT),
+        ("value", _Value),
+    ]
+
+
+_declare(ole32, "CoInitializeEx", ctypes.c_long, LPVOID, DWORD)
+_declare(ole32, "CoUninitialize", None)
+_declare(ole32, "CoCreateInstance", ctypes.c_long, ctypes.POINTER(GUID), LPVOID, DWORD, ctypes.POINTER(GUID),
+         ctypes.POINTER(LPVOID))
+_declare(oleaut32, "SysAllocString", LPVOID, wintypes.LPCWSTR)
+_declare(oleaut32, "SysFreeString", None, LPVOID)
+
+
+def _check_hresult(result: int, what: str) -> None:
+    if result < 0:
+        raise OSError(f"{what} falhou (0x{result & 0xFFFFFFFF:08X})")
+
+
+def _com_method(pointer: int, index: int, *argtypes):
+    """O método `index` da interface COM em `pointer`, pronto para chamar."""
+    vtable = ctypes.cast(LPVOID(pointer), ctypes.POINTER(ctypes.POINTER(LPVOID)))[0]
+    function = ctypes.WINFUNCTYPE(ctypes.c_long, LPVOID, *argtypes)(vtable[index])
+    return lambda *args: function(pointer, *args)
+
+
+class _ComObjects:
+    """Guarda as interfaces e textos COM obtidos no caminho e libera tudo no fim."""
+
+    def __init__(self):
+        self._interfaces: list[int] = []
+        self._strings: list[int] = []
+
+    def keep(self, pointer: int | None, what: str) -> int:
+        if not pointer:
+            raise OSError(f"{what}: o Explorer não devolveu nada")
+        self._interfaces.append(pointer)
+        return pointer
+
+    def query(self, pointer: int, iid: GUID, what: str) -> int:
+        result = LPVOID()
+        _check_hresult(
+            _com_method(pointer, _QUERY_INTERFACE, ctypes.POINTER(GUID), ctypes.POINTER(LPVOID))(
+                ctypes.byref(iid), ctypes.byref(result)
+            ),
+            what,
+        )
+        return self.keep(result.value, what)
+
+    def text(self, value: str) -> int:
+        bstr = oleaut32.SysAllocString(value)
+        if not bstr:
+            raise MemoryError("SysAllocString")
+        self._strings.append(bstr)
+        return bstr
+
+    def text_variant(self, value: str) -> VARIANT:
+        variant = VARIANT()
+        variant.vt = VT_BSTR
+        variant.value.bstrVal = self.text(value)
+        return variant
+
+    def release(self) -> None:
+        for pointer in reversed(self._interfaces):
+            _com_method(pointer, _RELEASE)()
+        for bstr in self._strings:
+            oleaut32.SysFreeString(bstr)
+        self._interfaces.clear()
+        self._strings.clear()
+
+
+def _explorer_shell_dispatch(objects: _ComObjects) -> int:
+    """IShellDispatch2 da área de trabalho — o objeto `Shell.Application` do Explorer que está rodando."""
+    windows = LPVOID()
+    _check_hresult(
+        ole32.CoCreateInstance(
+            ctypes.byref(CLSID_SHELL_WINDOWS), None, CLSCTX_LOCAL_SERVER,
+            ctypes.byref(IID_ISHELL_WINDOWS), ctypes.byref(windows),
+        ),
+        "CoCreateInstance(ShellWindows)",
+    )
+    objects.keep(windows.value, "ShellWindows")
+
+    location = VARIANT()
+    location.vt = VT_I4
+    location.value.lVal = CSIDL_DESKTOP
+    root = VARIANT()                    # VT_EMPTY
+    window = ctypes.c_long()
+    desktop = LPVOID()
+    _check_hresult(
+        _com_method(
+            windows.value, _SHELL_WINDOWS_FIND_WINDOW_SW, ctypes.POINTER(VARIANT), ctypes.POINTER(VARIANT),
+            ctypes.c_int, ctypes.POINTER(ctypes.c_long), ctypes.c_int, ctypes.POINTER(LPVOID),
+        )(ctypes.byref(location), ctypes.byref(root), SWC_DESKTOP, ctypes.byref(window), SWFO_NEEDDISPATCH,
+          ctypes.byref(desktop)),
+        "FindWindowSW(área de trabalho)",
+    )
+    objects.keep(desktop.value, "área de trabalho do Explorer")
+
+    provider = objects.query(desktop.value, IID_ISERVICE_PROVIDER, "IServiceProvider")
+    browser = LPVOID()
+    _check_hresult(
+        _com_method(
+            provider, _SERVICE_PROVIDER_QUERY_SERVICE,
+            ctypes.POINTER(GUID), ctypes.POINTER(GUID), ctypes.POINTER(LPVOID),
+        )(ctypes.byref(SID_STOP_LEVEL_BROWSER), ctypes.byref(IID_ISHELL_BROWSER), ctypes.byref(browser)),
+        "QueryService(IShellBrowser)",
+    )
+    objects.keep(browser.value, "IShellBrowser")
+
+    view = LPVOID()
+    _check_hresult(
+        _com_method(browser.value, _SHELL_BROWSER_QUERY_ACTIVE_SHELL_VIEW, ctypes.POINTER(LPVOID))(
+            ctypes.byref(view)
+        ),
+        "QueryActiveShellView",
+    )
+    objects.keep(view.value, "IShellView")
+
+    background = LPVOID()
+    _check_hresult(
+        _com_method(
+            view.value, _SHELL_VIEW_GET_ITEM_OBJECT, wintypes.UINT, ctypes.POINTER(GUID), ctypes.POINTER(LPVOID),
+        )(SVGIO_BACKGROUND, ctypes.byref(IID_IDISPATCH), ctypes.byref(background)),
+        "GetItemObject",
+    )
+    objects.keep(background.value, "fundo da área de trabalho")
+
+    folder_view = objects.query(background.value, IID_ISHELL_FOLDER_VIEW_DUAL, "IShellFolderViewDual")
+    application = LPVOID()
+    _check_hresult(
+        _com_method(folder_view, _FOLDER_VIEW_DUAL_GET_APPLICATION, ctypes.POINTER(LPVOID))(
+            ctypes.byref(application)
+        ),
+        "get_Application",
+    )
+    objects.keep(application.value, "Shell.Application")
+    return objects.query(application.value, IID_ISHELL_DISPATCH2, "IShellDispatch2")
+
+
+class _ExplorerGate:
+    """Entre o pedido e o prazo: depois do prazo, nada de ShellExecute atrasado."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.expired = False
+        self.executing = False
+
+    def enter(self) -> None:
+        with self._lock:
+            if self.expired:
+                raise OSError("o Explorer não respondeu a tempo")
+            self.executing = True
+
+
+def _in_com_thread(work, timeout: float = _EXPLORER_TIMEOUT):
+    """Roda `work(objetos, portão)` em uma thread própria com o COM iniciado.
+
+    Uma thread nova não interfere com a interface (Tk) nem com a sessão, e um
+    Explorer que não responde não prende quem chamou além do prazo. Antes de
+    pedir ao Explorer que abra algo, `work` chama `portão.enter()`: passado o
+    prazo, o pedido não sai mais (senão o programa abriria depois, em dobro).
+    """
+    outcome: dict = {}
+    gate = _ExplorerGate()
+
+    def runner() -> None:
+        initialized = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        objects = _ComObjects()
+        try:
+            _check_hresult(initialized, "CoInitializeEx")
+            outcome["value"] = work(objects, gate)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            try:
+                objects.release()
+            finally:
+                if initialized >= 0:
+                    ole32.CoUninitialize()
+
+    thread = threading.Thread(target=runner, name="explorer-com", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        with gate._lock:
+            gate.expired = True
+            in_flight = gate.executing
+        if in_flight:
+            # O pedido já foi feito: o programa pode abrir a qualquer momento.
+            raise ExplorerLaunchLost("o Explorer não respondeu a tempo")
+        raise OSError("o Explorer não respondeu")
+    if "error" in outcome:
+        error = outcome["error"]
+        raise error if isinstance(error, OSError) else OSError(f"{type(error).__name__}: {error}")
+    return outcome.get("value")
+
+
+def explorer_can_launch() -> bool:
+    """True se o Explorer da área de trabalho aceita abrir programas a pedido (não abre nada)."""
+    try:
+        return bool(_in_com_thread(lambda objects, gate: _explorer_shell_dispatch(objects)))
+    except OSError as exc:
+        log.info("Explorer indisponível para abrir programas: %s", exc)
+        return False
+
+
+def open_url(url: str) -> None:
+    """Abre um endereço no navegador do usuário, nunca com o privilégio do launcher.
+
+    Elevado, um os.startfile abriria o navegador como administrador; por isso o
+    pedido vai para o Explorer, como em spawn_via_explorer (sem esperar PID: o
+    navegador costuma entregar o endereço a uma janela que já estava aberta).
+    """
+    if not url.startswith(("https://", "http://")):
+        raise OSError("endereço inválido")
+    if not is_elevated():
+        os.startfile(url)
+        return
+
+    def launch(objects: _ComObjects, gate: _ExplorerGate) -> None:
+        shell = _explorer_shell_dispatch(objects)
+        show = VARIANT()
+        show.vt = VT_I4
+        show.value.lVal = SW_SHOWNORMAL
+        gate.enter()
+        _check_hresult(
+            _com_method(shell, _SHELL_DISPATCH2_SHELL_EXECUTE, LPVOID, VARIANT, VARIANT, VARIANT, VARIANT)(
+                objects.text(url), objects.text_variant(""), objects.text_variant(""),
+                objects.text_variant("open"), show,
+            ),
+            "ShellExecute",
+        )
+
+    _in_com_thread(launch)
+
+
+class ExplorerLaunchLost(OSError):
+    """O Explorer aceitou o pedido, mas o processo não apareceu a tempo."""
+
+
+def spawn_via_explorer(executable: str, arguments: list[str]) -> int:
+    """Pede ao Explorer que abra o programa, como um clique no atalho; devolve o PID.
+
+    O ShellExecute do Explorer não informa o PID: ele é achado depois, pelo
+    processo novo com o mesmo executável e os mesmos argumentos.
+    """
+    name = os.path.basename(executable)
+    parameters = subprocess.list2cmdline(arguments)
+    directory = os.path.dirname(executable)
+    before = set(pids_by_name(name))
+
+    def launch(objects: _ComObjects, gate: _ExplorerGate) -> None:
+        shell = _explorer_shell_dispatch(objects)
+        show = VARIANT()
+        show.vt = VT_I4
+        show.value.lVal = SW_SHOWNORMAL
+        gate.enter()
+        _check_hresult(
+            _com_method(shell, _SHELL_DISPATCH2_SHELL_EXECUTE, LPVOID, VARIANT, VARIANT, VARIANT, VARIANT)(
+                objects.text(executable), objects.text_variant(parameters), objects.text_variant(directory),
+                objects.text_variant("open"), show,
+            ),
+            "ShellExecute",
+        )
+
+    wait = _EXPLORER_TIMEOUT
+    try:
+        _in_com_thread(launch)
+    except ExplorerLaunchLost:
+        # O Explorer demorou, mas o pedido já tinha sido feito: o programa pode
+        # aparecer a qualquer momento. Espera mais por ele em vez de desistir (ou de
+        # abrir outra cópia por outro caminho).
+        wait = 3 * _EXPLORER_TIMEOUT
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        for pid in pids_by_name(name):
+            if pid in before:
+                continue
+            command_line = process_command_line(pid)
+            if command_line and "--type=" not in command_line and command_line.rstrip().endswith(parameters):
+                return pid
+        time.sleep(0.1)
+    raise ExplorerLaunchLost(f"o Explorer não abriu {name}")
+
+
 _DE_ELEVATION_ATTEMPTS = 3
 
 
@@ -1034,8 +1380,9 @@ def spawn_detached(executable: str, arguments: list[str]) -> int:
     executá-la elevada daria poder de administrador a quem trocasse o arquivo.
     Com o launcher elevado, tenta-se, nesta ordem:
 
-    1. iniciar como filho do Explorer (o usuário da área de trabalho);
-    2. iniciar com o token rebaixado do próprio launcher (se a conta for a mesma).
+    1. pedir ao Explorer que abra o programa (igual a um clique no atalho);
+    2. iniciar como filho do Explorer (o usuário da área de trabalho);
+    3. iniciar com o token rebaixado do próprio launcher (se a conta for a mesma).
 
     Se nada disso funcionar, falha — em vez de abrir como administrador.
     """
@@ -1050,6 +1397,17 @@ def spawn_detached(executable: str, arguments: list[str]) -> int:
                 close_fds=True,
             )
         return process.pid
+
+    try:
+        pid = spawn_via_explorer(executable, arguments)
+        log.info("%s aberto pelo Explorer", os.path.basename(executable))
+        return pid
+    except ExplorerLaunchLost:
+        # O pedido foi aceito e o programa pode estar abrindo devagar: abrir
+        # outra cópia por outro caminho só criaria uma segunda instância.
+        raise
+    except OSError as exc:
+        log.warning("abrir pelo Explorer falhou: %s", exc)
 
     for attempt in range(_DE_ELEVATION_ATTEMPTS):
         try:

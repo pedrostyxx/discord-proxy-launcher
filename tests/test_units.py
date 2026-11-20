@@ -420,14 +420,42 @@ class WinTest(FakeDiscordCase):
         })
 
     def test_elevated_launcher_starts_the_program_without_elevation(self):
-        # Finge que o launcher está elevado: o caminho usado é o de "filho do Explorer".
+        # Finge que o launcher está elevado: o programa é aberto pelo próprio Explorer.
         self.patch_win("is_elevated", lambda: True)
+        self.patch_win("spawn_as_desktop_user", self.must_not_be_used)
+        self.patch_win("spawn_with_limited_token", self.must_not_be_used)
         install = fakes.fake_install(self.root)
         before = len(self.launches())
-        pid = win.spawn_detached(install.exe_path, fakes.fake_arguments(install, "y"))
+        pid = win.spawn_detached(install.exe_path, fakes.fake_arguments(install, "--proxy-server=socks5://127.0.0.1:7"))
         self.assertTrue(fakes.wait_until(lambda: len(self.launches()) > before))
+        launch = self.launches()[-1]
+        self.assertEqual(launch["pid"], pid)
+        self.assertEqual(launch["args"], "--proxy-server=socks5://127.0.0.1:7")
+        self.assertFalse(launch["elevated"])
+        self.assertEqual(launch["leaked"], "")                  # nada do ambiente do launcher
         parents = {child: parent for child, parent, _ in win.list_processes()}
         self.assertEqual(parents[pid], self.shell_pid())
+        self.assertEqual(win.kill_by_name(fakes.FAKE_EXE), 1)
+
+    @staticmethod
+    def must_not_be_used(*args):
+        raise AssertionError("o plano B não devia ser usado")
+
+    def test_explorer_that_accepted_but_opened_nothing_is_not_retried_another_way(self):
+        # Abrir de novo por outro caminho criaria uma segunda cópia do Discord.
+        def lost(*args):
+            raise win.ExplorerLaunchLost("o Explorer não abriu FakeChatDPL.exe")
+
+        self.patch_win("is_elevated", lambda: True)
+        self.patch_win("spawn_via_explorer", lost)
+        self.patch_win("spawn_as_desktop_user", self.must_not_be_used)
+        self.patch_win("spawn_with_limited_token", self.must_not_be_used)
+        install = fakes.fake_install(self.root)
+        with self.assertRaises(win.ExplorerLaunchLost):
+            win.spawn_detached(install.exe_path, fakes.fake_arguments(install, "z"))
+
+    def test_explorer_is_available_here(self):
+        self.assertTrue(win.explorer_can_launch())
 
     @staticmethod
     def no_explorer(*args):
@@ -455,6 +483,7 @@ class WinTest(FakeDiscordCase):
 
     def test_without_explorer_the_limited_token_is_used(self):
         self.patch_win("is_elevated", lambda: True)
+        self.patch_win("spawn_via_explorer", self.no_explorer)
         self.patch_win("spawn_as_desktop_user", self.no_explorer)
         install = fakes.fake_install(self.root)
         before = len(self.launches())
@@ -467,6 +496,7 @@ class WinTest(FakeDiscordCase):
             raise OSError("CreateRestrictedToken falhou")
 
         self.patch_win("is_elevated", lambda: True)
+        self.patch_win("spawn_via_explorer", self.no_explorer)
         self.patch_win("spawn_as_desktop_user", self.no_explorer)
         self.patch_win("spawn_with_limited_token", broken)
         self.no_sleep()
@@ -487,6 +517,7 @@ class WinTest(FakeDiscordCase):
 
         self.patch_win("is_elevated", lambda: True)
         self.patch_win("desktop_user", lambda: OtherAccount())
+        self.patch_win("spawn_via_explorer", self.no_explorer)
         self.patch_win("spawn_as_desktop_user", self.no_explorer)
         self.patch_win("spawn_with_limited_token", lambda *args: used.append(args) or 1)
         self.no_sleep()
@@ -580,7 +611,11 @@ class ElevatedLauncherTest(FakeDiscordCase):
     """Com o launcher elevado, o Discord abria e fechava na hora ("'GPU' process
     exited with 'launch-failed'"): ele não conseguia usar o próprio token. Aqui o
     processo que cria o Discord falso tem o DACL padrão de um processo elevado, e o
-    Discord falso faz o mesmo que o Chromium faz ao subir."""
+    Discord falso faz o mesmo que o Chromium faz ao subir.
+
+    Na 1.0.1 o Discord ainda travava antes da tela de carregamento quando o
+    launcher era elevado de verdade. Desde a 1.0.2 quem cria o processo é o
+    próprio Explorer ("pelo-explorer"); os outros modos são os planos B."""
 
     def spawn_like_elevated(self, mode, without_fix=False):
         install = fakes.fake_install(self.root)
@@ -607,6 +642,13 @@ class ElevatedLauncherTest(FakeDiscordCase):
         self.assertFalse(launch["elevated"])
         self.assertIn(launch["pid"], win.pids_by_name(fakes.FAKE_EXE))      # continua aberto...
         self.assertEqual(win.kill_by_name(fakes.FAKE_EXE), 1)               # ...e o launcher consegue fechá-lo
+
+    def test_opened_by_explorer(self):
+        self.assert_starts_normally(self.spawn_like_elevated("pelo-explorer"))
+
+    def test_opened_by_explorer_needs_no_token_fix(self):
+        # Quem cria o processo é o Explorer: o DACL do launcher elevado não chega até ele.
+        self.assert_starts_normally(self.spawn_like_elevated("pelo-explorer", without_fix=True))
 
     def test_child_of_explorer(self):
         self.assert_starts_normally(self.spawn_like_elevated("explorer"))

@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
 import unittest
 
 import fakes
-from launcher import config, discord, proxies, session, socks5, win
+from launcher import config, dconnect, discord, proxies, session, socks5, win
 from test_ssh_mode import Recorder
+
+_real_connect = socks5.connect
 
 
 def address(index: int, block: int = 51) -> proxies.Proxy:
@@ -85,14 +88,27 @@ class PublicCase(unittest.TestCase):
         for item in self._sessions:
             item.join(20)
 
+    dedicated = None
+
     def start_session(self):
+        self.notices = []
         item = session.PublicSession(
+            dedicated=self.dedicated, on_notice=self.notices.append,
             on_status=self.recorder.on_status, on_finish=self.recorder.on_finish,
             find_install=lambda: fakes.fake_install(self.root),
         )
         self._sessions.append(item)
         item.start()
+        self.item = item
         return item
+
+    def relay_flag(self):
+        """A flag do Discord: o proxy local da sessão, que repassa ao proxy público ativo."""
+        self.assertTrue(fakes.wait_until(lambda: self.item._relay is not None, 10))
+        return self.flag(("127.0.0.1", self.item._relay.port))
+
+    def active(self):
+        return self.item._relay.active.proxy if self.item._relay and self.item._relay.active else None
 
     def launches(self):
         return fakes.read_launches(self.root)
@@ -120,7 +136,9 @@ class PublicCase(unittest.TestCase):
         return launches
 
 
-class ScriptedPublicSessionTest(PublicCase):
+class ScriptedCase(PublicCase):
+    """Internet roteirizada (World) no lugar das listas e dos proxies de verdade."""
+
     def setUp(self):
         super().setUp()
         self.world = World()
@@ -134,6 +152,8 @@ class ScriptedPublicSessionTest(PublicCase):
         self.patch(config, "HEALTH_INTERVAL", 1.0)
         self.patch(config, "TEST_ENOUGH_APPROVED", None)        # lista inteira: escolha determinística
 
+
+class ScriptedPublicSessionTest(ScriptedCase):
     def test_uses_the_fastest_and_fails_over_in_latency_order(self):
         first = [address(index) for index in range(1, 31)]
         second = [address(index, block=18) for index in range(1, 6)]
@@ -145,15 +165,17 @@ class ScriptedPublicSessionTest(PublicCase):
         mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {fast[0]}:1080 (50ms)")
         self.assertEqual(self.recorder.events[0], (session.BLUE, "Conectando..."))
         self.assertEqual(self.recorder.events[mark - 2], (session.YELLOW, "Testando proxies... (30/30) — 3 aprovados"))
-        self.assertEqual(self.wait_launches(1)[0]["args"], self.flag(fast))
+        launch = self.wait_launches(1)[0]
+        self.assertEqual(launch["args"], self.relay_flag())       # o Discord fala com o proxy local...
+        self.assertEqual(self.active(), fast)                     # ...que sai pelo mais rápido
         mark = self.recorder.wait_for(session.GREEN, "Proxy ativo", start=mark)      # monitor rodando
 
         del self.world.alive[fast]                    # o proxy ativo cai
         mark = self.recorder.wait_for(session.ORANGE, "Instabilidade detectada — trocando proxy...", start=mark)
         mark = self.recorder.wait_for(session.GREEN, f"Reconectado via {medium[0]}:1080", start=mark)
-        launches = self.wait_launches(2)
-        self.assertEqual(launches[1]["args"], self.flag(medium))
-        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [launches[1]["pid"]])     # fechou um, abriu outro
+        self.assertEqual(self.active(), medium)
+        self.assertEqual(self.wait_launches(1)[0]["pid"], launch["pid"])               # trocou sem reabrir o Discord
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [launch["pid"]])
         mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {medium[0]}:1080 (100ms)", start=mark)
 
         del self.world.alive[medium]
@@ -164,7 +186,8 @@ class ScriptedPublicSessionTest(PublicCase):
         downloads = self.world.downloads
         mark = self.recorder.wait_for(session.GREEN, f"Reconectado via {late[0]}:1080", start=mark)
         self.assertGreater(self.world.downloads, downloads)
-        self.assertEqual(self.wait_launches(4)[3]["args"], self.flag(late))
+        self.assertEqual(self.active(), late)
+        self.assertEqual(len(self.launches()), 1)
         texts = [text for color, text in self.recorder.events if color == session.ORANGE]
         self.assertIn("Instabilidade — trocando proxy... (5/5) — 1 aprovado", texts)
 
@@ -190,11 +213,12 @@ class ScriptedPublicSessionTest(PublicCase):
         time.sleep(1.0)
         self.assertEqual(len(self.launches()), 1)       # a troca de proxy não o reabriu
         self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [])
-        # Quando ele reabrir o Discord pelo atalho (sem proxy), a vigia o traz para o proxy atual.
+        # Quando ele reabrir o Discord pelo atalho (sem proxy), a vigia o traz para o proxy local.
         install = fakes.fake_install(self.root)
         win.spawn_detached(install.exe_path, fakes.fake_arguments(install))
         self.recorder.wait_for(session.ORANGE, "O Discord reiniciou sem o proxy", start=mark)
-        self.wait_proxied_launches([self.flag(best), self.flag(reserve)])
+        self.wait_proxied_launches([self.relay_flag(), self.relay_flag()])
+        self.assertEqual(self.active(), reserve)
 
     def test_local_outage_while_testing_does_not_burn_the_list(self):
         everyone = [address(index) for index in range(1, 201)]
@@ -279,8 +303,8 @@ class ScriptedPublicSessionTest(PublicCase):
         del self.world.alive[best]
         del self.world.alive[second]                            # a reserva seguinte morreu também
         self.recorder.wait_for(session.GREEN, f"Reconectado via {third[0]}:1080", start=mark)
-        launches = self.wait_launches(2)
-        self.assertEqual([entry["args"] for entry in launches], [self.flag(best), self.flag(third)])
+        self.assertEqual(self.active(), third)
+        self.assertEqual([entry["args"] for entry in self.wait_launches(1)], [self.relay_flag()])
 
     def test_progress_text_and_early_stop(self):
         everyone = [address(index % 250 + 1, block=51 + index // 250) for index in range(400)]
@@ -295,8 +319,8 @@ class ScriptedPublicSessionTest(PublicCase):
             self.assertRegex(text, r"^Testando proxies\.\.\. \(\d+/400\) — \d+ aprovados?$")
         self.assertTrue(any(text.endswith("— 1 aprovado") for text in yellow))
         self.assertLess(len(self.world.checked), 60)            # parou cedo; o resto fica para depois
-        active = self.wait_launches(1)[0]["args"]
-        self.assertRegex(active, r"^--proxy-server=socks5://198\.\d+\.100\.\d+:1080$")
+        self.assertRegex(self.wait_launches(1)[0]["args"], r"^--proxy-server=socks5://127\.0\.0\.1:\d+$")
+        self.assertRegex(f"{self.active()[0]}:{self.active()[1]}", r"^198\.\d+\.100\.\d+:1080$")
 
     def test_no_list_available(self):
         self.world.lists = []
@@ -372,7 +396,181 @@ class ScriptedPublicSessionTest(PublicCase):
         win.kill_pid(first)
         win.spawn_detached(install.exe_path, fakes.fake_arguments(install))
         self.recorder.wait_for(session.ORANGE, "O Discord reiniciou sem o proxy", start=mark)
-        self.wait_proxied_launches([self.flag(only), self.flag(only)])
+        self.wait_proxied_launches([self.relay_flag(), self.relay_flag()])
+
+    def test_proxy_losing_in_discords_own_connections_is_replaced_without_restarting_discord(self):
+        # O 1.1.1.1:80 responde pelo proxy ativo, mas as conexões do Discord por ele
+        # falham e saem pela reserva: o relay avisa e a sessão troca o ativo.
+        best, reserve = address(1), address(2)
+        self.world.alive = {best: 100.0, reserve: 200.0}
+        self.world.lists = [("Fonte A", [best, reserve])]
+        self.patch(config, "HEALTH_INTERVAL", 60.0)             # a troca vem do relay, não da verificação
+        echo_left, echo_right = socket.socketpair()
+        self.addCleanup(echo_left.close)
+        self.addCleanup(echo_right.close)
+        pairs = []
+
+        def fake_connect(proxy, host, port, *, deadline):
+            if tuple(proxy) == best:
+                raise socks5.ProxyError("falha geral", 1)
+            left, right = socket.socketpair()
+            pairs.append((left, right))
+            self.addCleanup(left.close)
+            self.addCleanup(right.close)
+            return left
+
+        self.patch(socks5, "connect", fake_connect)
+        self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {best[0]}")
+        launch = self.wait_launches(1)[0]
+        for _ in range(config.RELAY_MAX_STRIKES):               # o "Discord" abre conexões pelo relay
+            _real_connect(("127.0.0.1", self.item._relay.port), "discord.com", 443,
+                          deadline=time.monotonic() + 10).close()
+        self.assertEqual(len(pairs), config.RELAY_MAX_STRIKES)  # todas saíram pela reserva
+        mark = self.recorder.wait_for(session.ORANGE, "Instabilidade detectada — trocando proxy...", start=mark)
+        self.recorder.wait_for(session.GREEN, f"Reconectado via {reserve[0]}:1080", start=mark)
+        self.assertEqual(self.active(), reserve)
+        self.assertEqual(self.wait_launches(1)[0]["pid"], launch["pid"])
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [launch["pid"]])
+
+
+class VpsWorld:
+    """O servidor dedicado de mentira: no ar, fora do ar ou recusando esta versão do app."""
+
+    def __init__(self):
+        self.up = True
+        self.rejected = False
+        self.checks = 0
+        self.healths = 0
+
+    def _state(self):
+        if self.rejected:
+            raise dconnect.TokenRejected("versão aposentada", 410, "token_aposentado")
+        if not self.up:
+            raise dconnect.ServerUnavailable("fora do ar")
+
+    def check(self, server, timeout=None):
+        self.checks += 1
+        self._state()
+        return dconnect.Check(40.0, "FR")
+
+    def health(self, server, timeout=None):
+        self.healths += 1
+        self._state()
+        return dconnect.Health(20.0, "ok", "FR")
+
+
+class DedicatedServerSessionTest(ScriptedCase):
+    dedicated = dconnect.DedicatedServer("wss://dconnect.example.test/t/abcdef012345", "t" * 43)
+    VPS_TEXT = "servidor dedicado de pedrostyxx · França"
+
+    def setUp(self):
+        super().setUp()
+        self.vps = VpsWorld()
+        self.patch(dconnect, "check", self.vps.check)
+        self.patch(dconnect, "health", self.vps.health)
+        self.patch(config, "VPS_RETRY_INITIAL", 1.0)
+        self.patch(config, "VPS_RETURN_CONFIRM", 0.5)
+        self.patch(config, "VPS_GRACE_DELAYS", (0.1, 0.1, 0.1))
+        self.reserve = address(7)
+        self.world.alive = {self.reserve: 100.0}
+        self.world.lists = [("Fonte A", [self.reserve, address(8)])]
+
+    def test_uses_the_dedicated_server_and_leaves_the_lists_alone(self):
+        self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT} (40ms)")
+        self.assertEqual(self.recorder.events[1], (session.BLUE, "Conectando ao servidor dedicado..."))
+        self.assertEqual(self.wait_launches(1)[0]["args"], self.relay_flag())
+        self.assertTrue(self.item._relay.active.dedicated)
+        self.assertEqual(self.notices, ["vps"])
+        self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT} (20ms)", start=mark)   # health
+        self.assertEqual(self.world.downloads, 0)            # as listas ficam só de reserva
+
+    def test_down_at_start_then_comes_back_without_reopening_discord(self):
+        self.vps.up = False
+        self.start_session()
+        mark = self.recorder.wait_for(session.YELLOW, "Servidor dedicado indisponível — usando proxies públicos...")
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.reserve[0]}:1080", start=mark)
+        launch = self.wait_launches(1)[0]
+        self.assertEqual(self.notices, [])
+        checks = self.vps.checks
+        self.vps.up = True
+        self.recorder.wait_for(session.GREEN, f"Reconectado via {self.VPS_TEXT}", start=mark, timeout=20)
+        self.assertGreaterEqual(self.vps.checks - checks, 2)          # confirmou antes de voltar
+        self.assertTrue(self.item._relay.active.dedicated)
+        self.assertEqual(self.notices, ["vps"])
+        self.assertEqual([entry["pid"] for entry in self.launches()], [launch["pid"]])
+
+    def test_rejected_version_is_final_for_the_session(self):
+        self.vps.rejected = True
+        self.start_session()
+        mark = self.recorder.wait_for(
+            session.YELLOW, "O servidor dedicado não aceita esta versão do app — usando proxies públicos...")
+        self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.reserve[0]}:1080", start=mark)
+        self.assertEqual(self.notices, ["vps_update"])
+        time.sleep(3)                                       # bem mais que o tempo de nova tentativa
+        self.assertEqual(self.vps.checks, 1)
+
+    def test_dies_mid_session_and_falls_back_to_the_lists(self):
+        self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}")
+        launch = self.wait_launches(1)[0]
+        self.vps.up = False
+        mark = self.recorder.wait_for(session.ORANGE, "Servidor dedicado instável — tentando reconectar...", start=mark)
+        mark = self.recorder.wait_for(
+            session.ORANGE, "Servidor dedicado instável — trocando para proxies públicos...", start=mark)
+        self.recorder.wait_for(session.GREEN, f"Reconectado via {self.reserve[0]}:1080", start=mark)
+        self.assertFalse(self.item._relay.active.dedicated)
+        self.assertEqual(self.notices, ["vps", None])
+        self.assertEqual([entry["pid"] for entry in self.launches()], [launch["pid"]])
+
+    def test_a_quick_restart_of_the_server_is_absorbed(self):
+        self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}")
+        healths = self.vps.healths
+        self.vps.up = False
+        fakes.wait_until(lambda: self.vps.healths >= healths + 2, 10)   # duas verificações falharam
+        self.vps.up = True                                              # voltou durante a tolerância
+        self.recorder.wait_for(session.ORANGE, "Servidor dedicado instável — tentando reconectar...", start=mark)
+        self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}", start=mark + 1)
+        self.assertNotIn("trocando para proxies públicos", " ".join(text for _, text in self.recorder.events))
+        self.assertEqual(self.world.downloads, 0)
+
+    def test_rejection_mid_session_shows_the_update_notice_at_once(self):
+        item = self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}")
+        self.vps.rejected = True                            # o dono trocou o token: esta versão ficou velha
+        mark = self.recorder.wait_for(
+            session.ORANGE, "O servidor dedicado não aceita mais esta versão do app — usando proxies públicos...",
+            start=mark)
+        self.assertEqual(self.notices, ["vps", "vps_update"])           # sem ficar com o painel verde
+        self.recorder.wait_for(session.GREEN, f"Reconectado via {self.reserve[0]}:1080", start=mark)
+        checks = self.vps.checks
+        time.sleep(2.5)
+        self.assertEqual(self.vps.checks, checks)                       # não insiste
+        item.stop()
+        self.assertTrue(self.recorder.finished.wait(10))
+        self.assertEqual(self.notices, ["vps", "vps_update"])           # o aviso continua depois do fim
+
+    def test_a_server_that_refuses_everything_is_left_at_once(self):
+        self.start_session()
+        mark = self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}")
+        launch = self.wait_launches(1)[0]
+        with self.item._relay._lock:
+            self.item._relay._vps_refusing = True       # o relay viu o servidor recusar tudo (cota, limites)
+        mark = self.recorder.wait_for(
+            session.ORANGE, "Servidor dedicado instável — trocando para proxies públicos...", start=mark)
+        self.recorder.wait_for(session.GREEN, f"Reconectado via {self.reserve[0]}:1080", start=mark)
+        texts = " ".join(text for _, text in self.recorder.events)
+        self.assertNotIn("tentando reconectar", texts)          # sem a tolerância: o /health diria que está tudo bem
+        self.assertEqual([entry["pid"] for entry in self.launches()], [launch["pid"]])
+
+    def test_stop_clears_the_notice(self):
+        item = self.start_session()
+        self.recorder.wait_for(session.GREEN, f"Proxy ativo — {self.VPS_TEXT}")
+        item.stop()
+        self.assertTrue(self.recorder.finished.wait(10))
+        self.assertEqual(self.notices, ["vps", None])
 
 
 @unittest.skipUnless(os.environ.get("DPL_NETWORK_TESTS") == "1", "defina DPL_NETWORK_TESTS=1 para usar a rede de verdade")
@@ -384,9 +582,8 @@ class RealNetworkTest(PublicCase):
         mark = self.recorder.wait_for(session.GREEN, "Proxy ativo — ", timeout=300)
         print(f"\n  primeiro proxy em {time.monotonic() - started:.0f}s: {self.recorder.events[mark - 1][1]}")
         launch = self.wait_launches(1)[0]
-        match = re.fullmatch(r"--proxy-server=socks5://(\d+\.\d+\.\d+\.\d+):(\d+)", launch["args"])
-        self.assertTrue(match, launch)
-        self.assertIn(f"{match.group(1)}:{match.group(2)}", self.recorder.events[mark - 1][1])
+        self.assertEqual(launch["args"], self.relay_flag())
+        self.assertIn(self.item._relay.active.address, self.recorder.events[mark - 1][1])
         # Deixa o monitor de verdade rodar algumas rondas contra 1.1.1.1:80 pelo proxy.
         time.sleep(40)
         for color, text in self.recorder.events[mark:]:

@@ -15,7 +15,8 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TITLE = "Discord Proxy Launcher"
+TITLE = "Discord Proxy Launcher"                        # caixas de mensagem
+WINDOW_TITLE = "Discord Proxy Launcher - By: pedrostyxx"  # a janela principal
 WM_CLOSE = 0x0010
 
 
@@ -45,11 +46,16 @@ def main() -> int:
     user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_size_t]
     user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
 
+    if user32.FindWindowW("TkTopLevel", WINDOW_TITLE) or user32.FindWindowW("TkTopLevel", TITLE):
+        # Um launcher do usuário já está aberto: a instância única não deixaria
+        # esta abrir, e o WM_CLOSE abaixo iria para a janela dele.
+        print("janela: NÃO CONFERIDA — já há um Discord Proxy Launcher aberto; feche-o e rode de novo")
+        return 3
     started = time.monotonic()
     app = subprocess.Popen([exe], env=env)
     window = None
     while time.monotonic() - started < 20:
-        window = user32.FindWindowW("TkTopLevel", TITLE)
+        window = user32.FindWindowW("TkTopLevel", WINDOW_TITLE)
         if window and user32.IsWindowVisible(window):
             break
         time.sleep(0.1)

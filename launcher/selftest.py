@@ -76,7 +76,16 @@ def _windows_api() -> dict:
         "porta_135_tem_dono": bool(win.tcp_listener_pids(135)),
         "pastas_do_usuario_existem": os.path.isdir(local_app_data) and os.path.isdir(profile),
         "token_rebaixado": bool(token),
+        # O caminho usado para abrir o Discord com o app elevado (nada é aberto aqui).
+        "explorer_abre_programas": win.explorer_can_launch(),
     }
+
+
+def _dedicated() -> str:
+    from . import config
+
+    server = config.load_dedicated()
+    return f"incluído ({server.host})" if server else "não incluído neste build"
 
 
 def _discord() -> str:
@@ -117,6 +126,7 @@ def run(output_path: str | None) -> int:
         ("paramiko", _paramiko_loopback),
         ("windows_api", _windows_api),
         ("discord", _discord),
+        ("servidor_dedicado", _dedicated),
         ("ssh_exe", _ssh_exe),
         ("icone", _icon),
     ):

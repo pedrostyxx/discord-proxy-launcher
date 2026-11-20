@@ -73,23 +73,36 @@ def main() -> None:
     shot("4-proxy-publico")
 
     app._set_running(True)
+    app._set_status(session.BLUE, "Conectando ao servidor dedicado...")
+    shot("5-proxy-publico-conectando")
+
+    app._apply_notice("vps")
+    app._set_status(session.GREEN, "Proxy ativo — servidor dedicado de pedrostyxx · França (38ms)")
+    shot("6-proxy-publico-dedicado")
+
+    app._apply_notice(None)
     app._set_status(session.YELLOW, "Testando proxies... (87/1114) — 4 aprovados")
-    shot("5-proxy-publico-testando")
+    shot("7-proxy-publico-testando")
 
-    app._set_status(session.GREEN, "Proxy ativo — 203.0.113.77:1080 (412ms)")
-    shot("6-proxy-publico-ativo")
+    app._set_status(session.GREEN, "Reconectado via 203.0.113.77:1080 · EUA")
+    shot("8-proxy-publico-reserva")
 
-    app._set_status(session.ORANGE, "Instabilidade detectada — trocando proxy...")
-    shot("7-proxy-publico-instavel")
+    app._set_status(session.ORANGE, "Servidor dedicado instável — trocando para proxies públicos...")
+    shot("9-proxy-publico-instavel")
+
+    app._apply_notice("vps_update")
+    app._set_status(session.GREEN, "Proxy ativo — 203.0.113.77:1080 · EUA (412ms)")
+    shot("10-proxy-publico-atualizar")
+    app._apply_notice(None)
 
     app._set_running(False)
     app._show("ssh")
     app._set_status(session.RED, "Erro: a chave do servidor mudou — se você o reinstalou, rode: ssh-keygen -R 203.0.113.25")
-    shot("8-meu-servidor-erro")
+    shot("11-meu-servidor-erro")
 
     app._set_running(True)                      # como no app: "Conectando..." já trava os campos e o Iniciar
     app._set_status(session.BLUE, "Conectando...")
-    shot("9-conectando")
+    shot("12-conectando")
     app._destroy()
     print("scale", app._scale)
 

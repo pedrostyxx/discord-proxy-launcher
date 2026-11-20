@@ -5,12 +5,15 @@ próprios botões.
 """
 from __future__ import annotations
 
+import gc
 import time
 import tkinter as tk
 import unittest
 
 import fakes  # noqa: F401  (ajusta o sys.path)
-from launcher import session, ui
+from launcher import config, dconnect, session, ui
+
+DEDICATED = dconnect.DedicatedServer("wss://dconnect.example.test/t/abcdef012345", "t" * 43)
 
 
 class FakeSession:
@@ -20,8 +23,10 @@ class FakeSession:
 
     def __init__(self, *args, on_status, on_finish, **kwargs):
         self.args = args
+        self.kwargs = kwargs
         self.on_status = on_status
         self.on_finish = on_finish
+        self.on_notice = kwargs.get("on_notice", lambda kind: None)
         self.started = False
         self.stop_requested = False
         self.abandoned = False
@@ -38,7 +43,12 @@ class FakeSession:
 
 
 class UiTest(unittest.TestCase):
+    dedicated = DEDICATED           # não depende do dconnect.json desta máquina
+
     def setUp(self):
+        original = config.load_dedicated
+        config.load_dedicated = lambda: self.dedicated
+        self.addCleanup(setattr, config, "load_dedicated", original)
         FakeSession.created = []
         for name in ("SshSession", "PublicSession"):
             original = getattr(session, name)
@@ -51,6 +61,11 @@ class UiTest(unittest.TestCase):
     def _destroy(self):
         if not self.app._destroyed:
             self.app._destroy()
+        # As variáveis do Tk (StringVar...) precisam ser coletadas aqui, na thread
+        # principal: coletadas depois, numa thread qualquer de outro teste, cada uma
+        # trava aquela thread por ~1 s esperando um mainloop que não existe.
+        self.app = None
+        gc.collect()
 
     def pump(self, seconds: float = 0.25):
         deadline = time.monotonic() + seconds
@@ -242,12 +257,111 @@ class UiTest(unittest.TestCase):
         self.assertTrue(created.abandoned)                # o túnel e o Discord são fechados daqui mesmo
         self.assertTrue(self.app._destroyed)
 
+    def visible_notice(self):
+        return [kind for kind, panel in self.app._notice_panels.items() if panel.winfo_manager()]
+
+    def test_window_title_credits_the_author(self):
+        self.assertEqual(self.app.root.title(), "Discord Proxy Launcher - By: pedrostyxx")
+        self.assertEqual(config.APP_NAME, "Discord Proxy Launcher")   # mensagens continuam com o nome
+
+    def test_public_session_gets_the_dedicated_server_and_the_notice_callback(self):
+        self.app._show("public")
+        self.click_start()
+        (created,) = FakeSession.created
+        self.assertIn("dedicated", created.kwargs)
+        self.assertIn("on_notice", created.kwargs)
+
+    def test_notice_panels_follow_the_session(self):
+        self.app._show("public")
+        self.assertEqual(self.visible_notice(), [None])              # o aviso das listas grátis
+        self.click_start()
+        (created,) = FakeSession.created
+        created.on_notice("vps")                                      # vem da thread da sessão
+        self.pump(0.2)
+        self.assertEqual(self.visible_notice(), ["vps"])
+        holder_height = self.app._notice_holder.winfo_height()
+        created.on_notice("vps_update")
+        self.pump(0.2)
+        self.assertEqual(self.visible_notice(), ["vps_update"])
+        self.assertEqual(self.app._notice_holder.winfo_height(), holder_height)   # o resto da tela não se mexe
+        created.on_notice("vps")
+        self.click_stop()
+        created.on_finish()
+        self.pump(0.2)
+        self.assertEqual(self.visible_notice(), [None])              # parou: volta ao aviso padrão
+
+    def test_panels_fit_with_the_buttons_visible(self):
+        self.app._show("public")
+        for kind in (None, "vps", "vps_update"):
+            self.app._apply_notice(kind)
+            self.pump(0.1)
+            button = self.app._start_buttons[1]
+            bottom = button.winfo_rooty() + button.winfo_height() - self.app._container.winfo_rooty()
+            self.assertLessEqual(bottom, self.app._container.winfo_height(), kind)
+
+    def test_link_opens_through_win_open_url(self):
+        opened = []
+        original = ui.win.open_url
+        ui.win.open_url = opened.append
+        self.addCleanup(setattr, ui.win, "open_url", original)
+        self.app._open_link(config.INSTAGRAM_URL)
+        deadline = time.monotonic() + 5
+        while not opened and time.monotonic() < deadline:
+            self.pump(0.05)
+        self.assertEqual(opened, [config.INSTAGRAM_URL])
+
+    def test_link_failure_copies_the_address(self):
+        def broken(url):
+            raise OSError("sem Explorer")
+
+        original = ui.win.open_url
+        ui.win.open_url = broken
+        self.addCleanup(setattr, ui.win, "open_url", original)
+        self.app._set_status(session.GREEN, "Proxy ativo — servidor dedicado")
+        link = self.app._links[config.INSTAGRAM_URL]
+        self.app._open_link(config.INSTAGRAM_URL)
+        deadline = time.monotonic() + 5
+        while "copiado" not in link.cget("text") and time.monotonic() < deadline:
+            self.pump(0.05)
+        self.assertIn("copiado", link.cget("text"))              # avisa no próprio link...
+        self.assertEqual(self.status(), "Proxy ativo — servidor dedicado")    # ...sem mexer no status
+        self.assertEqual(self.app.root.clipboard_get(), config.INSTAGRAM_URL)
+
+    def test_update_notice_survives_the_end_of_the_session(self):
+        self.app._show("public")
+        self.click_start()
+        (created,) = FakeSession.created
+        created.on_notice("vps_update")
+        created.on_finish()
+        self.pump(0.2)
+        self.assertEqual(self.visible_notice(), ["vps_update"])
+        self.click_start()                                    # uma nova tentativa recomeça do aviso padrão
+        self.assertEqual(self.visible_notice(), [None])
+
     def test_every_widget_was_built_without_tk_errors(self):
         for name in ("home", "ssh", "public"):
             self.app._show(name)
             self.pump(0.05)
         self.assertIsInstance(self.app.root, tk.Tk)
         self.assertGreater(self.app._container.winfo_reqheight(), 100)
+
+
+
+class WithoutDedicatedServerTest(UiTest):
+    """Build sem o servidor dedicado (forks, -NoDedicated): só o aviso das listas, sem espaço sobrando."""
+
+    dedicated = None
+
+    def test_only_the_free_list_warning_exists(self):
+        self.assertEqual(list(self.app._notice_panels), [None])
+        self.assertEqual(self.app._notice_holder.winfo_reqheight(), self.app._notice_panels[None].winfo_reqheight())
+
+    # Os testes dos painéis do servidor dedicado não se aplicam aqui.
+    test_notice_panels_follow_the_session = None
+    test_link_opens_through_win_open_url = None
+    test_link_failure_copies_the_address = None
+    test_update_notice_survives_the_end_of_the_session = None
+    test_panels_fit_with_the_buttons_visible = None
 
 
 if __name__ == "__main__":
