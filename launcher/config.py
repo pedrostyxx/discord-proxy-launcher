@@ -1,7 +1,7 @@
 """Parâmetros do launcher — os números da especificação reunidos em um só lugar."""
 
 APP_NAME = "Discord Proxy Launcher"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # --- Modo A: túnel SSH -----------------------------------------------------
 LOCAL_SOCKS_HOST = "127.0.0.1"

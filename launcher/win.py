@@ -37,6 +37,7 @@ ole32 = _system_dll("ole32")
 userenv = _system_dll("userenv")
 iphlpapi = _system_dll("iphlpapi")
 wtsapi32 = _system_dll("wtsapi32")
+ntdll = _system_dll("ntdll")
 
 SIZE_T = ctypes.c_size_t
 LPVOID = wintypes.LPVOID
@@ -63,8 +64,12 @@ TOKEN_ADJUST_DEFAULT = 0x0080
 SE_PRIVILEGE_ENABLED = 0x00000002
 SE_GROUP_INTEGRITY = 0x00000020
 LUA_TOKEN = 0x4                         # CreateRestrictedToken: token "filtrado", como o do UAC
+TOKEN_DEFAULT_DACL_CLASS = 6
+TOKEN_LOGON_SID_CLASS = 28
 TOKEN_INTEGRITY_LEVEL_CLASS = 25
 MEDIUM_INTEGRITY_SID = "S-1-16-8192"
+SDDL_REVISION_1 = 1
+PROCESS_COMMAND_LINE_INFORMATION = 60
 CREATE_NO_WINDOW = 0x08000000
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -133,6 +138,19 @@ class SID_AND_ATTRIBUTES(ctypes.Structure):
 
 class TOKEN_MANDATORY_LABEL(ctypes.Structure):
     _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+
+class TOKEN_DEFAULT_DACL(ctypes.Structure):
+    _fields_ = [("DefaultDacl", LPVOID)]
+
+
+class TOKEN_GROUPS_1(ctypes.Structure):
+    """TOKEN_GROUPS com um grupo (o ctypes cuida do alinhamento de Groups em 64 bits)."""
+    _fields_ = [("GroupCount", DWORD), ("Groups", SID_AND_ATTRIBUTES * 1)]
+
+
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", LPVOID)]
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -257,6 +275,12 @@ _declare(advapi32, "CreateProcessAsUserW", BOOL, HANDLE, wintypes.LPCWSTR, winty
 _declare(wtsapi32, "WTSQuerySessionInformationW", BOOL, HANDLE, DWORD, ctypes.c_int,
          ctypes.POINTER(LPVOID), ctypes.POINTER(DWORD))
 _declare(wtsapi32, "WTSFreeMemory", None, LPVOID)
+_declare(advapi32, "ConvertStringSecurityDescriptorToSecurityDescriptorW", BOOL, wintypes.LPCWSTR, DWORD,
+         ctypes.POINTER(LPVOID), ctypes.POINTER(wintypes.ULONG))
+_declare(advapi32, "GetSecurityDescriptorDacl", BOOL, LPVOID, ctypes.POINTER(BOOL), ctypes.POINTER(LPVOID),
+         ctypes.POINTER(BOOL))
+_declare(ntdll, "NtQueryInformationProcess", ctypes.c_long, HANDLE, ctypes.c_int, LPVOID, wintypes.ULONG,
+         ctypes.POINTER(wintypes.ULONG))
 
 FOLDERID_LOCAL_APP_DATA = GUID.parse("F1B32785-6FBA-4FCF-9D55-7B8E7F157091")
 FOLDERID_PROFILE = GUID.parse("5E6C858F-0E22-4760-9AFE-EA3317B67173")
@@ -342,6 +366,11 @@ def _session_of(pid: int) -> int | None:
     return None
 
 
+def in_current_session(pid: int) -> bool:
+    """True se o processo está na mesma sessão do Windows que o launcher."""
+    return _session_of(pid) == _session_of(kernel32.GetCurrentProcessId())
+
+
 def pids_by_name(exe_name: str) -> list[int]:
     """PIDs dos processos `exe_name` na sessão do Windows do usuário atual."""
     wanted = exe_name.lower()
@@ -355,11 +384,40 @@ def pids_by_name(exe_name: str) -> list[int]:
 def kill_pid(pid: int, wait_ms: int = 2000) -> bool:
     """Encerra o processo. True se ele terminou (ou já não existia)."""
     handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    error = 0 if handle else ctypes.get_last_error()
+    if error == ERROR_ACCESS_DENIED and desktop_user().other_account and _enable_privilege("SeDebugPrivilege"):
+        # Elevado com OUTRA conta, os processos do usuário da área de trabalho só se
+        # deixam encerrar com o privilégio de depuração. Com a mesma conta eles já
+        # podem ser encerrados: ali, "acesso negado" é processo de outra conta ou de
+        # um serviço, que o launcher não deve tocar.
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+        error = 0 if handle else ctypes.get_last_error()
     if not handle:
-        return ctypes.get_last_error() != ERROR_ACCESS_DENIED
+        return error != ERROR_ACCESS_DENIED      # outro erro: o processo já não existe
     try:
         kernel32.TerminateProcess(handle, 1)
         return kernel32.WaitForSingleObject(handle, wait_ms) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_command_line(pid: int) -> str | None:
+    """Linha de comando com que o processo foi iniciado (None se não der para ler)."""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.ULONG(0)
+        ntdll.NtQueryInformationProcess(handle, PROCESS_COMMAND_LINE_INFORMATION, None, 0, ctypes.byref(size))
+        if not size.value:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if ntdll.NtQueryInformationProcess(
+            handle, PROCESS_COMMAND_LINE_INFORMATION, buffer, size, ctypes.byref(size)
+        ) < 0:
+            return None
+        text = UNICODE_STRING.from_buffer(buffer)
+        return ctypes.wstring_at(text.Buffer, text.Length // 2) if text.Buffer else ""
     finally:
         kernel32.CloseHandle(handle)
 
@@ -577,16 +635,22 @@ class _DesktopUser:
     def __init__(self) -> None:
         self.other_account = False
         self.domain = self.name = ""
+        self.sid: str | None = None
         local = profile = None
         try:
             self.domain, self.name = session_user()
-            sid = account_sid(self.domain, self.name)
-            if sid != process_user_sid():
+            self.sid = account_sid(self.domain, self.name)
+            if self.sid != process_user_sid():
                 self.other_account = True
-                local, profile = profile_dirs_from_registry(sid)
+                local, profile = profile_dirs_from_registry(self.sid)
         except OSError as exc:
             log.info("usuário da área de trabalho não identificado: %s", exc)
             self.other_account = False
+        if self.sid is None:
+            try:
+                self.sid = process_user_sid()
+            except OSError:
+                pass
         if local is None or profile is None:
             try:
                 local = _known_folder(FOLDERID_LOCAL_APP_DATA, None)
@@ -665,6 +729,122 @@ class default_dll_directory:
         _spawn_lock.release()
 
 
+# --- Permissões dos objetos do processo novo --------------------------------------
+#
+# O Windows protege o processo novo (o objeto do processo, a thread e o token
+# dele) com o DACL padrão de QUEM O CRIA — não do usuário com que ele vai rodar.
+# Com o launcher elevado, esse DACL é "só Administradores e SYSTEM". O Discord,
+# rodando como usuário comum, não consegue abrir o próprio token, e o Chromium
+# dele falha ao criar os processos filhos ("'GPU' process exited with
+# 'launch-failed'"): o Discord fecha assim que abre. Por isso, enquanto o
+# processo é criado, o DACL padrão do launcher passa a ser o do usuário comum.
+
+
+def _token_default_dacl(token) -> ctypes.Array:
+    """DACL padrão do token, dentro de um buffer que começa com um TOKEN_DEFAULT_DACL
+    (o buffer precisa continuar vivo enquanto o ponteiro para o ACL for usado)."""
+    size = DWORD(0)
+    advapi32.GetTokenInformation(token, TOKEN_DEFAULT_DACL_CLASS, None, 0, ctypes.byref(size))
+    if not size.value:
+        raise _win_error("GetTokenInformation(TokenDefaultDacl)")
+    buffer = ctypes.create_string_buffer(size.value)
+    if not advapi32.GetTokenInformation(token, TOKEN_DEFAULT_DACL_CLASS, buffer, size, ctypes.byref(size)):
+        raise _win_error("GetTokenInformation(TokenDefaultDacl)")
+    return buffer
+
+
+def _own_logon_sid() -> str | None:
+    """SID da sessão de logon deste processo (o mesmo da área de trabalho, quando a conta é a mesma)."""
+    token = HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        size = DWORD(0)
+        advapi32.GetTokenInformation(token, TOKEN_LOGON_SID_CLASS, None, 0, ctypes.byref(size))
+        if size.value < ctypes.sizeof(TOKEN_GROUPS_1):
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, TOKEN_LOGON_SID_CLASS, buffer, size, ctypes.byref(size)):
+            return None
+        groups = TOKEN_GROUPS_1.from_buffer(buffer)
+        if groups.GroupCount < 1 or not groups.Groups[0].Sid:
+            return None
+        return _sid_string(groups.Groups[0].Sid)
+    except OSError:
+        return None
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _set_token_default_dacl(token, acl) -> None:
+    holder = TOKEN_DEFAULT_DACL(acl)
+    if not advapi32.SetTokenInformation(token, TOKEN_DEFAULT_DACL_CLASS, ctypes.byref(holder), ctypes.sizeof(holder)):
+        raise _win_error("SetTokenInformation(TokenDefaultDacl)")
+
+
+class _UserDacl:
+    """Um ACL como o DACL padrão de um usuário comum: acesso total ao usuário e ao
+    SYSTEM e leitura/execução à sessão de logon. Com `admins`, também acesso total
+    aos Administradores (o launcher elevado com outra conta precisa disso para
+    encerrar o processo depois)."""
+
+    def __init__(self, user_sid: str, logon_sid: str | None = None, admins: bool = True):
+        self._descriptor = LPVOID()
+        aces = [f"(A;;GA;;;{user_sid})", "(A;;GA;;;SY)"]
+        if logon_sid:
+            aces.append(f"(A;;GRGX;;;{logon_sid})")
+        if admins:
+            aces.append("(A;;GA;;;BA)")
+        sddl = "D:" + "".join(aces)
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, SDDL_REVISION_1, ctypes.byref(self._descriptor), None
+        ):
+            raise _win_error("ConvertStringSecurityDescriptorToSecurityDescriptor")
+        present, defaulted, acl = BOOL(), BOOL(), LPVOID()
+        if not advapi32.GetSecurityDescriptorDacl(
+            self._descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)
+        ) or not present.value or not acl.value:
+            self.close()
+            raise OSError("não foi possível montar o DACL do usuário")
+        self.acl = acl.value
+
+    def close(self) -> None:
+        if self._descriptor.value:
+            kernel32.LocalFree(self._descriptor)
+            self._descriptor = LPVOID()
+
+
+class _creator_default_dacl:
+    """Troca o DACL padrão deste processo enquanto um processo filho é criado."""
+
+    def __init__(self, acl):
+        self._acl = acl
+
+    def __enter__(self):
+        token = HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, ctypes.byref(token)
+        ):
+            raise _win_error("OpenProcessToken")
+        try:
+            self._saved = _token_default_dacl(token)
+            _set_token_default_dacl(token, self._acl)
+        except BaseException:
+            kernel32.CloseHandle(token)
+            raise
+        self._token = token
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            saved = TOKEN_DEFAULT_DACL.from_buffer(self._saved).DefaultDacl
+            _set_token_default_dacl(self._token, saved)
+        except OSError as error:
+            log.warning("não foi possível restaurar o DACL padrão: %s", error)
+        finally:
+            kernel32.CloseHandle(self._token)
+
+
 def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
     """Inicia o programa como filho do Explorer; devolve o PID.
 
@@ -675,6 +855,8 @@ def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
     parent = HANDLE(_open_shell_process(PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION))
     environment = LPVOID()
     attributes = None
+    explorer_dacl = None        # o DACL padrão do próprio Explorer: o mais fiel ao "abrir pelo atalho"
+    user_dacl = None
     try:
         try:
             token = _shell_token(parent, TOKEN_QUERY | TOKEN_DUPLICATE)
@@ -684,11 +866,22 @@ def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
             try:
                 if not userenv.CreateEnvironmentBlock(ctypes.byref(environment), token, False):
                     environment = LPVOID()
+                try:
+                    explorer_dacl = _token_default_dacl(token)
+                    if not TOKEN_DEFAULT_DACL.from_buffer(explorer_dacl).DefaultDacl:
+                        explorer_dacl = None
+                except OSError:
+                    explorer_dacl = None
             finally:
                 kernel32.CloseHandle(token)
         fallback_environment = None
         if not environment.value:
             fallback_environment = _hand_built_environment()
+        if explorer_dacl is not None:
+            child_acl = TOKEN_DEFAULT_DACL.from_buffer(explorer_dacl).DefaultDacl
+        else:
+            user_dacl = _UserDacl(_desktop_user_sid())
+            child_acl = user_dacl.acl
 
         size = SIZE_T(0)
         kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
@@ -706,7 +899,7 @@ def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
         startup.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
         startup.lpAttributeList = ctypes.cast(attributes, LPVOID)
         info = PROCESS_INFORMATION()
-        with default_dll_directory():
+        with default_dll_directory(), _creator_default_dacl(child_acl):
             created = kernel32.CreateProcessW(
                 executable, command_line, None, None, False,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
@@ -714,8 +907,9 @@ def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
                 os.path.dirname(executable) or None,
                 ctypes.byref(startup), ctypes.byref(info),
             )
-        if not created:
-            raise _win_error("CreateProcess")
+            error = None if created else _win_error("CreateProcess")
+        if error is not None:
+            raise error
         kernel32.CloseHandle(info.hThread)
         kernel32.CloseHandle(info.hProcess)
         return info.dwProcessId
@@ -724,7 +918,16 @@ def spawn_as_desktop_user(executable: str, arguments: list[str]) -> int:
             kernel32.DeleteProcThreadAttributeList(attributes)
         if environment.value:
             userenv.DestroyEnvironmentBlock(environment)
+        if user_dacl is not None:
+            user_dacl.close()
         kernel32.CloseHandle(parent)
+
+
+def _desktop_user_sid() -> str:
+    sid = desktop_user().sid
+    if not sid:
+        raise OSError("usuário da área de trabalho não identificado")
+    return sid
 
 
 def _hand_built_environment():
@@ -782,16 +985,23 @@ def spawn_with_limited_token(executable: str, arguments: list[str]) -> int:
     perfil errado).
     """
     command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline([executable, *arguments]))
-    token = HANDLE(_limited_token())
+    # Só é usado com a conta da área de trabalho: o DACL fica igual ao de um usuário
+    # comum que abre o programa (o launcher, com o mesmo usuário, ainda consegue encerrá-lo).
+    user_dacl = _UserDacl(process_user_sid(), logon_sid=_own_logon_sid(), admins=False)
     environment = LPVOID()
+    token = None
     try:
+        token = HANDLE(_limited_token())
+        # O token rebaixado herda o DACL padrão do token elevado ("só Administradores
+        # e SYSTEM"), e os objetos que o programa criar ficariam inacessíveis para ele mesmo.
+        _set_token_default_dacl(token, user_dacl.acl)
         if not userenv.CreateEnvironmentBlock(ctypes.byref(environment), token, False):
             environment = LPVOID()
         fallback_environment = None if environment.value else _hand_built_environment()
         startup = STARTUPINFOW()
         startup.cb = ctypes.sizeof(STARTUPINFOW)
         info = PROCESS_INFORMATION()
-        with default_dll_directory():
+        with default_dll_directory(), _creator_default_dacl(user_dacl.acl):
             created = advapi32.CreateProcessAsUserW(
                 token, executable, command_line, None, None, False,
                 CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
@@ -799,15 +1009,18 @@ def spawn_with_limited_token(executable: str, arguments: list[str]) -> int:
                 os.path.dirname(executable) or None,
                 ctypes.byref(startup), ctypes.byref(info),
             )
-        if not created:
-            raise _win_error("CreateProcessAsUser")
+            error = None if created else _win_error("CreateProcessAsUser")
+        if error is not None:
+            raise error
         kernel32.CloseHandle(info.hThread)
         kernel32.CloseHandle(info.hProcess)
         return info.dwProcessId
     finally:
         if environment.value:
             userenv.DestroyEnvironmentBlock(environment)
-        kernel32.CloseHandle(token)
+        if token is not None:
+            kernel32.CloseHandle(token)
+        user_dacl.close()
 
 
 _DE_ELEVATION_ATTEMPTS = 3

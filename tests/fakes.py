@@ -273,14 +273,47 @@ import time
 here = os.path.dirname(os.path.abspath(__file__))
 names = ("TCL_LIBRARY", "TK_LIBRARY", "_PYI_APPLICATION_HOME_DIR", "_MEIPASS2", "DPL_TEST_MARKER")
 leaked = "".join(name + ";" for name in names if os.environ.get(name))
+
+# O que o Chromium do Discord faz ao subir: abre o próprio token (para criar os
+# tokens restritos dos processos filhos), o próprio processo e objetos que ele
+# mesmo criou. Se algo disso falhar, o Discord fecha na hora — e este também.
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+adv = ctypes.WinDLL("advapi32", use_last_error=True)
+k32.GetCurrentProcess.restype = ctypes.c_void_p
+k32.OpenProcess.restype = ctypes.c_void_p
+k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+k32.CreateEventW.restype = ctypes.c_void_p
+k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+k32.OpenEventW.restype = ctypes.c_void_p
+k32.OpenEventW.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p]
+k32.CloseHandle.argtypes = [ctypes.c_void_p]
+adv.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
+token = ctypes.c_void_p()
+token_ok = bool(adv.OpenProcessToken(k32.GetCurrentProcess(), 0x008B, ctypes.byref(token)))   # DUPLICATE|ASSIGN|QUERY|ADJUST_DEFAULT
+if token_ok:
+    k32.CloseHandle(token)
+own = k32.OpenProcess(0x0440, False, os.getpid())                                           # DUP_HANDLE|QUERY_INFORMATION
+process_ok = bool(own)
+if own:
+    k32.CloseHandle(own)
+event_name = "Local\\\\dpl-fake-%d" % os.getpid()
+event = k32.CreateEventW(None, True, False, event_name)
+again = k32.OpenEventW(0x1F0003, False, event_name)                                         # EVENT_ALL_ACCESS
+objects_ok = bool(event) and bool(again)
+
 line = "\\t".join([
     str(os.getpid()),
     " ".join(sys.argv[1:]),
     str(bool(ctypes.windll.shell32.IsUserAnAdmin())),
     leaked,
+    str(token_ok),
+    str(process_ok),
+    str(objects_ok),
 ])
 with open(os.path.join(here, "launches.log"), "a", encoding="utf-8") as handle:
     handle.write(line + "\\n")
+if not (token_ok and process_ok and objects_ok):
+    sys.exit(3)
 time.sleep(3600)
 '''
 
@@ -336,8 +369,11 @@ def read_launches(root: str, version: str = "1.0.10") -> list[dict]:
         return []
     launches = []
     for line in lines:
-        pid, arguments, elevated, leaked = (line.split("\t") + ["", "", "", ""])[:4]
-        launches.append({"pid": int(pid), "args": arguments, "elevated": elevated == "True", "leaked": leaked})
+        pid, arguments, elevated, leaked, token_ok, process_ok, objects_ok = (line.split("\t") + [""] * 7)[:7]
+        launches.append({
+            "pid": int(pid), "args": arguments, "elevated": elevated == "True", "leaked": leaked,
+            "token_ok": token_ok == "True", "process_ok": process_ok == "True", "objects_ok": objects_ok == "True",
+        })
     return launches
 
 

@@ -576,5 +576,62 @@ class WinTest(FakeDiscordCase):
         self.assertTrue(fakes.wait_until(lambda: child_pid not in win.pids_by_name(fakes.FAKE_EXE), 5))
 
 
+class ElevatedLauncherTest(FakeDiscordCase):
+    """Com o launcher elevado, o Discord abria e fechava na hora ("'GPU' process
+    exited with 'launch-failed'"): ele não conseguia usar o próprio token. Aqui o
+    processo que cria o Discord falso tem o DACL padrão de um processo elevado, e o
+    Discord falso faz o mesmo que o Chromium faz ao subir."""
+
+    def spawn_like_elevated(self, mode, without_fix=False):
+        install = fakes.fake_install(self.root)
+        before = len(self.launches())
+        command = [sys.executable, os.path.join(fakes.ROOT, "tests", "elevated_creator.py"),
+                   fakes.ROOT, install.exe_path, mode]
+        if without_fix:
+            command.append("--sem-correcao")
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        pid_line, restored_line = done.stdout.strip().splitlines()[-2:]
+        pid = int(pid_line)
+        self.assertEqual(restored_line, "True", "o launcher não voltou ao próprio DACL padrão")
+        self.assertTrue(fakes.wait_until(lambda: len(self.launches()) > before, 15))
+        launch = self.launches()[-1]
+        self.assertEqual(launch["pid"], pid)
+        self.assertEqual(launch["args"], "--proxy-server=socks5://127.0.0.1:9")
+        return launch
+
+    def assert_starts_normally(self, launch):
+        self.assertEqual(
+            (launch["token_ok"], launch["process_ok"], launch["objects_ok"]), (True, True, True), launch
+        )
+        self.assertFalse(launch["elevated"])
+        self.assertIn(launch["pid"], win.pids_by_name(fakes.FAKE_EXE))      # continua aberto...
+        self.assertEqual(win.kill_by_name(fakes.FAKE_EXE), 1)               # ...e o launcher consegue fechá-lo
+
+    def test_child_of_explorer(self):
+        self.assert_starts_normally(self.spawn_like_elevated("explorer"))
+
+    def test_child_of_explorer_without_access_to_its_token(self):
+        self.assert_starts_normally(self.spawn_like_elevated("explorer-sddl"))
+
+    def test_limited_token(self):
+        self.assert_starts_normally(self.spawn_like_elevated("limitado"))
+
+    def test_without_the_fix_the_program_cannot_start(self):
+        # Prova de que o teste pega o defeito: sem a troca do DACL, o processo
+        # não consegue usar o próprio token e fecha na hora, como o Discord fechava.
+        launch = self.spawn_like_elevated("explorer", without_fix=True)
+        self.assertFalse(launch["token_ok"] and launch["process_ok"], launch)
+        self.assertTrue(fakes.wait_until(lambda: launch["pid"] not in win.pids_by_name(fakes.FAKE_EXE), 10))
+
+    def test_reads_the_command_line_of_another_process(self):
+        install = fakes.fake_install(self.root)
+        pid = win.spawn_detached(install.exe_path, fakes.fake_arguments(install, "--proxy-server=socks5://10.0.0.1:1"))
+        line = win.process_command_line(pid)
+        self.assertIsNotNone(line)
+        self.assertIn("--proxy-server=socks5://10.0.0.1:1", line.split())
+        self.assertIsNone(win.process_command_line(4_000_000))          # processo que não existe
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

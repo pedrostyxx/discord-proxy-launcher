@@ -75,8 +75,9 @@ def pick_local_port(preferred: int | None = None) -> int:
 def close_stale_ssh(port_in_use: int, preferred: int | None = None) -> int:
     """Encerra o `ssh` de um túnel antigo que ainda escute na porta padrão.
 
-    Só o processo dono daquela porta: outras sessões ssh do usuário não são
-    tocadas. Devolve quantos processos encerrou.
+    Só o processo dono daquela porta e só na sessão do usuário: outras sessões
+    ssh dele, de outros usuários do computador e de serviços não são tocadas.
+    Devolve quantos processos encerrou.
     """
     if preferred is None:
         preferred = config.LOCAL_SOCKS_PORT
@@ -84,7 +85,7 @@ def close_stale_ssh(port_in_use: int, preferred: int | None = None) -> int:
         return 0                            # quem escuta na porta padrão é o túnel novo
     closed = 0
     for pid in set(win.tcp_listener_pids(preferred)):
-        if (win.process_name(pid) or "").lower() == "ssh.exe":
+        if (win.process_name(pid) or "").lower() == "ssh.exe" and win.in_current_session(pid):
             log.info("encerrando túnel ssh antigo (pid %d) na porta %d", pid, preferred)
             if win.kill_pid(pid):
                 closed += 1

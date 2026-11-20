@@ -70,7 +70,9 @@ Os números estão todos em [`launcher/config.py`](../launcher/config.py).
   gastar a fila de proxies ou as três tentativas de reconexão.
 - **Vigia do Discord.** Ao se atualizar, o Discord reinicia sem o `--proxy-server`; o monitor percebe e o reabre
   pelo proxy. Se o usuário fechar o Discord, ele fica fechado. Se o Discord reiniciar sem proxy mais de 3 vezes
-  em 10 minutos, a sessão termina com erro.
+  em 10 minutos, a sessão termina com erro. Para decidir, o app lê a linha de comando do Discord que está
+  rodando: se o próprio Discord se reiniciou mantendo os argumentos (ainda no proxy), o app só passa a
+  acompanhar o processo novo, sem derrubá-lo.
 
 ### Túnel SSH (Meu servidor)
 
@@ -100,6 +102,12 @@ Os números estão todos em [`launcher/config.py`](../launcher/config.py).
   programa do usuário consegue alterar, e executá-la elevada daria poder de administrador a quem trocasse o
   arquivo. O app o inicia como filho do Explorer; se isso não for possível, com um token rebaixado do próprio
   app (só quando a conta é a mesma); se nem isso, mostra um erro.
+- **Permissões do processo novo.** O Windows protege o processo novo (o processo, a thread e o token dele) com
+  o DACL padrão de *quem o cria*. O de um processo elevado é "só Administradores e SYSTEM", e com ele o Discord
+  — rodando como usuário comum — não conseguia usar o próprio token: o Chromium dele não criava o processo de
+  GPU (`'GPU' process exited with 'launch-failed'`) e o Discord fechava ao abrir (corrigido na 1.0.1).
+  Enquanto cria o processo, o app passa a usar o DACL padrão do próprio Explorer (ou, se não der para lê-lo,
+  um equivalente montado a partir do SID do usuário) e depois volta ao seu.
 - **Elevação com outra conta.** Se o UAC for respondido com a senha de outra conta (ou com a "Proteção de
   administrador" do Windows 11), o app localiza o perfil de quem está na área de trabalho pelo Registro. Esse
   caminho foi escrito e testado por partes, mas não de ponta a ponta.

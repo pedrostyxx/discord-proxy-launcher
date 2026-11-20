@@ -1011,6 +1011,61 @@ class SshSessionTest(SshCase):
         self.assertNotIn(rogue, win.pids_by_name(fakes.FAKE_EXE))                        # o intruso sem proxy saiu
         self.assertNotEqual(launches[0]["pid"], launches[1]["pid"])
 
+    def test_discord_restarting_itself_with_the_proxy_is_left_alone(self):
+        # Ao aplicar uma atualização, o Discord se reinicia mantendo os argumentos:
+        # o processo é outro, mas continua no proxy. O launcher não deve derrubá-lo.
+        server = self.server()
+        item = self.start_session(server, password=server.password)
+        self.recorder.wait_for(session.GREEN, "Proxy ativo")
+        install = fakes.fake_install(self.root)
+        first = self.wait_launches(1)[0]["pid"]
+        win.kill_pid(first)
+        relaunched = win.spawn_detached(install.exe_path, fakes.fake_arguments(install, self.proxy_flag()))
+        self.wait_launches(2)
+        time.sleep(7)                                   # várias rondas da vigia
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [relaunched])   # continua de pé
+        self.assertEqual(len(self.launches()), 2)                          # e o launcher não abriu outro
+        self.assertEqual(item._discord_pid, relaunched)                    # passou a acompanhar o novo
+        self.assertNotIn("O Discord reiniciou sem o proxy", self.recorder.texts())
+        item.stop()                                     # e é ele que o Parar fecha
+        self.assertTrue(self.recorder.finished.wait(15))
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [])
+
+    def test_only_auxiliary_discord_processes_do_not_trigger_a_reopen(self):
+        # No meio de um reinício (ou logo depois de o usuário fechar o Discord) só
+        # sobram processos auxiliares, com --type=. O launcher espera, não reabre.
+        server = self.server()
+        item = self.start_session(server, password=server.password)
+        self.recorder.wait_for(session.GREEN, "Proxy ativo")
+        install = fakes.fake_install(self.root)
+        win.kill_pid(self.wait_launches(1)[0]["pid"])
+        helper = win.spawn_detached(
+            install.exe_path, fakes.fake_arguments(install, "--type=relauncher", self.proxy_flag())
+        )
+        self.wait_launches(2)
+        time.sleep(7)                                   # várias rondas da vigia
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [helper])       # não foi derrubado
+        self.assertNotEqual(item._discord_pid, helper)                     # nem adotado como principal
+        self.assertEqual(len(self.launches()), 2)
+        self.assertNotIn("O Discord reiniciou sem o proxy", self.recorder.texts())
+
+    def test_a_similar_but_different_proxy_flag_is_reopened(self):
+        # Só vale a flag exata: 127.0.0.1:<porta>0 não é o proxy deste launcher.
+        server = self.server()
+        self.start_session(server, password=server.password)
+        mark = self.recorder.wait_for(session.GREEN, "Proxy ativo")
+        install = fakes.fake_install(self.root)
+        win.kill_pid(self.wait_launches(1)[0]["pid"])
+        other = win.spawn_detached(
+            install.exe_path, fakes.fake_arguments(install, f"--proxy-server=socks5://{HOST}:{self.local_port}0")
+        )
+        mark = self.recorder.wait_for(session.ORANGE, "O Discord reiniciou sem o proxy", start=mark)
+        self.recorder.wait_for(session.GREEN, "Proxy ativo", start=mark)
+        launches = self.wait_proxied_launches([self.proxy_flag(), f"--proxy-server=socks5://{HOST}:{self.local_port}0",
+                                               self.proxy_flag()])
+        self.assertNotIn(other, win.pids_by_name(fakes.FAKE_EXE))
+        self.assertEqual(win.pids_by_name(fakes.FAKE_EXE), [launches[-1]["pid"]])
+
     def test_discord_that_keeps_restarting_without_the_proxy_ends_the_session(self):
         server = self.server()
         self.start_session(server, password=server.password)

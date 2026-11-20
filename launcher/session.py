@@ -181,6 +181,28 @@ class Session(threading.Thread):
             except OSError as exc:
                 raise SessionError(f"não foi possível abrir o Discord ({exc.strerror or exc})") from exc
 
+    def _classify_discord(self, pids: list[int]) -> tuple[int | None, bool]:
+        """(PID do processo principal que já usa o nosso proxy, há um principal sem ele?).
+
+        Processos auxiliares do Discord (GPU, renderer, o "relauncher" que ele usa
+        para se reiniciar...) têm `--type=` na linha de comando e não contam. Um
+        processo cuja linha de comando não dá para ler conta, na dúvida, como
+        principal sem o proxy.
+        """
+        flag = discord.proxy_argument(*self._active_proxy())
+        proxied, unproxied = None, False
+        for pid in pids:
+            command_line = win.process_command_line(pid)
+            if not command_line:
+                unproxied = True
+            elif "--type=" in command_line:
+                continue
+            elif flag in command_line.split():
+                proxied = proxied or pid
+            else:
+                unproxied = True
+        return proxied, unproxied
+
     def _watch_discord(self) -> None:
         """Reabre o Discord com o proxy se ele reiniciou por conta própria.
 
@@ -192,6 +214,17 @@ class Session(threading.Thread):
             return
         running = win.pids_by_name(self._install.exe_name)
         if not running or self._discord_pid in running:
+            return
+        proxied, unproxied = self._classify_discord(running)
+        if proxied is not None:
+            # O próprio Discord se reiniciou mantendo os argumentos (acontece ao
+            # aplicar atualizações): ele continua no proxy, basta acompanhá-lo.
+            log.info("o Discord reiniciou com o proxy (pid %d); nada a fazer", proxied)
+            self._discord_pid = proxied
+            return
+        if not unproxied:
+            # Só processos auxiliares: o Discord está no meio de um reinício (o
+            # principal novo ainda vai aparecer) ou acabou de ser fechado. Espera.
             return
         now = time.monotonic()
         self._reopen_times = [moment for moment in self._reopen_times if now - moment < _REOPEN_WINDOW]
