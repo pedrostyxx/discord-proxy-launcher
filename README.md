@@ -87,9 +87,8 @@ não perto do proxy (veja [Limitações](#limitações)).
 
 1. **[Baixe o `discord-proxy-launcher.zip`](https://github.com/pedrostyxx/discord-proxy-launcher/releases/latest/download/discord-proxy-launcher.zip)**
    e extraia (botão direito → **Extrair tudo**). Não tem instalação: o app é a pasta `discord-proxy-launcher`.
-   Abrir direto de dentro do `.zip`, sem extrair, não funciona.
-   - Prefere um arquivo só? Cada [versão](https://github.com/pedrostyxx/discord-proxy-launcher/releases) também
-     traz o `discord-proxy-launcher.exe` avulso, mas navegadores e antivírus desconfiam mais desse formato.
+   Abrir direto de dentro do `.zip`, sem extrair, não funciona: o `.exe` precisa do `discord-proxy-launcher.pkg`
+   e da pasta `_internal` ao lado dele.
 2. **Abra o `discord-proxy-launcher.exe`** de dentro da pasta extraída e aceite o pedido de permissão do Windows —
    o app pede para rodar como administrador.
    - Se aparecer *"O Windows protegeu o computador"*, clique em **Mais informações → Executar assim mesmo**. O
@@ -238,14 +237,15 @@ estiver disponível, um cliente SSH embutido.
 
 ## Para desenvolvedores
 
-O app é feito em Python 3.12 com tkinter e compilado com PyInstaller, em pasta (`.zip`) e em `.exe` único, com o
-bootloader do PyInstaller compilado na hora (o pronto é o que mais gera falsos positivos em antivírus) — para isso
+O app é feito em Python 3.12 com tkinter e compilado com PyInstaller em pasta (`.zip`), com o bootloader do
+PyInstaller compilado na hora e o pacote do app num `.pkg` ao lado do `.exe`, em vez de anexado a ele: o bootloader
+pronto e o pacote anexado são o que fazia antivírus acusarem falsos positivos (detalhes no `build.ps1`). Para isso
 o build precisa do Visual Studio Build Tools com o workload C++. O build oficial embute o
 `dconnect.json` (endereço e token do servidor dedicado), que não fica no repositório — veja
 [server/README.md](server/README.md). Sem ele, compile com `-NoDedicated`: o app usa só as listas públicas.
 
 ```powershell
-# compilar: cria o .venv, instala as dependências e gera dist\discord-proxy-launcher.zip e .exe
+# compilar: cria o .venv, instala as dependências e gera dist\discord-proxy-launcher.zip
 powershell -ExecutionPolicy Bypass -File build.ps1 -NoDedicated
 
 # rodar os testes
