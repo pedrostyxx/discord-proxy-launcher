@@ -1,0 +1,33 @@
+# Compila o app num Windows limpo (como o build.ps1 faz localmente, sem o servidor
+# dedicado) e roda o autoteste embutido e a checagem da janela no executável gerado.
+# Serve para conferir o empacotamento em máquinas onde o Smart App Control impede
+# rodar o .exe recém-compilado.
+name: build-check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["ci/**"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Testes
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
+          .\.venv\Scripts\python.exe -m unittest discover -s tests
+      - name: Build (bootloader compilado aqui, pacote fora do .exe)
+        run: powershell -ExecutionPolicy Bypass -File build.ps1 -NoDedicated
+      - name: Autoteste do executável
+        run: .\.venv\Scripts\python.exe tests\check_exe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discord-proxy-launcher-sem-dedicado
+          path: dist/discord-proxy-launcher.zip
+          retention-days: 3

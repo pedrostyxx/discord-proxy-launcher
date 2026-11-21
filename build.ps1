@@ -1,18 +1,19 @@
-# Compila o app (sem console, pede elevação UAC ao abrir) em dois formatos:
-#   dist\discord-proxy-launcher.zip   pasta do app (discord-proxy-launcher.exe + _internal) — o download principal
-#   dist\discord-proxy-launcher.exe   arquivo único, para quem ainda usa o link antigo
+# Compila o app (sem console, pede elevação UAC ao abrir) em dist\discord-proxy-launcher.zip,
+# com a pasta do app: discord-proxy-launcher.exe + discord-proxy-launcher.pkg + _internal.
 # Uso:  powershell -ExecutionPolicy Bypass -File build.ps1 [-NoDedicated]
 #
 # O servidor dedicado (dconnect.json, fora do Git porque tem o token do app) é
 # embutido no app. Sem ele o build para, a não ser que -NoDedicated seja dado:
 # um app sem o servidor dedicado só usaria as listas públicas.
 #
-# Antivírus e o Chrome: o bootloader pronto do PyInstaller (o mesmo dentro de
-# milhares de .exe, inclusive de malware) é o que mais gera falsos positivos.
-# Por isso o PyInstaller do .venv é instalado com o bootloader compilado aqui,
-# o que exige o Visual Studio Build Tools com o workload "C++" (VCTools). O
-# formato em pasta é o que menos dispara detecções genéricas: nada é extraído
-# para a pasta temporária ao abrir.
+# Antivírus e o Chrome (medido no VirusTotal, 1.1.2):
+# - .exe único com o bootloader pronto do PyInstaller: 3/71 (CrowdStrike, Bkav, SecureAge);
+# - bootloader compilado aqui, pacote anexado ao .exe: 2/71 (CrowdStrike, SecureAge);
+# - bootloader compilado aqui e o pacote (PKG) num arquivo .pkg ao lado do .exe: 0/71.
+# O que os detectores por aprendizado de máquina pegam é o bloco grande de dados
+# compactados anexado ao fim do .exe. Por isso: bootloader compilado aqui (exige
+# o Visual Studio Build Tools com o workload "C++", VCTools), EXE(append_pkg=False)
+# e nada de arquivo único (que precisa do pacote anexado).
 param([switch]$NoDedicated)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -53,30 +54,43 @@ if ($NoDedicated) {
     # Valida com o mesmo leitor do app (aceita BOM e UTF-16) e nunca mostra o token.
     & $python -c "import sys; from launcher import dconnect; s = dconnect.load('dconnect.json'); sys.exit(1) if s is None else print('Servidor dedicado: ' + s.host + s.path[:6] + '...')"
     if ($LASTEXITCODE -ne 0) { throw "dconnect.json invalido (veja server/README.md)" }
-    $extra = @("--add-data", "dconnect.json;.")
+    $extra = @("--add-data", "$PSScriptRoot\dconnect.json;.")
 } else {
     throw "dconnect.json nao encontrado: o app sairia sem o servidor dedicado. Use -NoDedicated para compilar assim mesmo."
 }
 
-$common = @(
-    "--noconfirm", "--clean", "--log-level", "WARN",
-    "--windowed", "--uac-admin", "--noupx",
+# --- spec com o pacote fora do .exe (append_pkg=False) -----------------------
+$work = Join-Path $PSScriptRoot "build"
+New-Item -ItemType Directory -Force $work | Out-Null
+$specArgs = @(
+    "--windowed", "--uac-admin", "--noupx", "--onedir",
     "--name", "discord-proxy-launcher",
-    "--icon", "assets\icon.ico",
-    "--add-data", "assets\icon.ico;assets",
-    "--version-file", "version_info.txt"
+    "--icon", "$PSScriptRoot\assets\icon.ico",
+    "--add-data", "$PSScriptRoot\assets\icon.ico;assets",
+    "--version-file", "$PSScriptRoot\version_info.txt",
+    "--specpath", $work
 ) + $extra
+& (Join-Path $PSScriptRoot ".venv\Scripts\pyi-makespec.exe") @specArgs "$PSScriptRoot\main.py" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "pyi-makespec falhou (codigo $LASTEXITCODE)" }
+$spec = Join-Path $work "discord-proxy-launcher.spec"
+$text = Get-Content $spec -Raw
+if ($text -notmatch "exclude_binaries=True,") { throw "spec inesperado: exclude_binaries nao encontrado" }
+$text = $text -replace "exclude_binaries=True,", "exclude_binaries=True,`r`n    append_pkg=False,"
+[System.IO.File]::WriteAllText($spec, $text)
 
-foreach ($mode in "--onedir", "--onefile") {
-    & $python -m PyInstaller @common $mode main.py
-    if ($LASTEXITCODE -ne 0) { throw "PyInstaller $mode falhou (codigo $LASTEXITCODE)" }
+$dist = Join-Path $PSScriptRoot "dist"
+& $python -m PyInstaller --noconfirm --clean --log-level WARN --distpath $dist --workpath $work $spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller falhou (codigo $LASTEXITCODE)" }
+
+$folder = Join-Path $dist "discord-proxy-launcher"
+foreach ($name in "discord-proxy-launcher.exe", "discord-proxy-launcher.pkg") {
+    if (-not (Test-Path (Join-Path $folder $name))) { throw "faltou $name na pasta do app" }
 }
-
-$folder = Join-Path $PSScriptRoot "dist\discord-proxy-launcher"
-$zip = Join-Path $PSScriptRoot "dist\discord-proxy-launcher.zip"
+$single = Join-Path $dist "discord-proxy-launcher.exe"
+if (Test-Path $single) { Remove-Item $single }     # sobra de builds antigos (arquivo único)
+$zip = Join-Path $dist "discord-proxy-launcher.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path $folder -DestinationPath $zip -CompressionLevel Optimal
 
-foreach ($item in (Get-Item $zip), (Get-Item (Join-Path $PSScriptRoot "dist\discord-proxy-launcher.exe"))) {
-    "{0}  ({1:N1} MB)" -f $item.FullName, ($item.Length / 1MB)
-}
+$item = Get-Item $zip
+"{0}  ({1:N1} MB)" -f $item.FullName, ($item.Length / 1MB)

@@ -21,7 +21,7 @@ WM_CLOSE = 0x0010
 
 
 def main() -> int:
-    exe = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "dist", "discord-proxy-launcher.exe"))
+    exe = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "dist", "discord-proxy-launcher", "discord-proxy-launcher.exe"))
     env = dict(os.environ, __COMPAT_LAYER="RunAsInvoker")
     env.pop("DPL_DEBUG_LOG", None)
 
