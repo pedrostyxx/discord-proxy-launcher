@@ -1,8 +1,8 @@
 # Propriedades do arquivo .exe (aba "Detalhes" do Windows). Lido pelo PyInstaller.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 1, 0),
-    prodvers=(1, 1, 1, 0),
+    filevers=(1, 1, 2, 0),
+    prodvers=(1, 1, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,12 +15,15 @@ VSVersionInfo(
       StringTable(
         '041604B0',
         [
+          StringStruct('CompanyName', 'pedrostyxx'),
           StringStruct('FileDescription', 'Discord Proxy Launcher'),
-          StringStruct('FileVersion', '1.1.1'),
+          StringStruct('LegalCopyright', 'pedrostyxx - github.com/pedrostyxx/discord-proxy-launcher'),
+          StringStruct('Comments', 'Abre o Discord atraves de um proxy. Codigo aberto: github.com/pedrostyxx/discord-proxy-launcher'),
+          StringStruct('FileVersion', '1.1.2'),
           StringStruct('InternalName', 'discord-proxy-launcher'),
           StringStruct('OriginalFilename', 'discord-proxy-launcher.exe'),
           StringStruct('ProductName', 'Discord Proxy Launcher'),
-          StringStruct('ProductVersion', '1.1.1'),
+          StringStruct('ProductVersion', '1.1.2'),
         ]
       )
     ]),

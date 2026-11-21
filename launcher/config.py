@@ -5,7 +5,7 @@ import os
 import sys
 
 APP_NAME = "Discord Proxy Launcher"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 AUTHOR = "pedrostyxx"
 WINDOW_TITLE = f"{APP_NAME} - By: {AUTHOR}"     # só a barra de título; mensagens usam APP_NAME
 

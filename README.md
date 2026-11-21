@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pedrostyxx/discord-proxy-launcher/releases/latest/download/discord-proxy-launcher.exe">
-    <img src="docs/images/botao-download.png" width="355" alt="Baixar o discord-proxy-launcher.exe para Windows">
+  <a href="https://github.com/pedrostyxx/discord-proxy-launcher/releases/latest/download/discord-proxy-launcher.zip">
+    <img src="docs/images/botao-download.png" width="355" alt="Baixar o discord-proxy-launcher.zip para Windows">
   </a>
   <br>
-  <sub>Windows 10 e 11 (64 bits) · arquivo único, sem instalação · <a href="https://github.com/pedrostyxx/discord-proxy-launcher/releases">todas as versões</a></sub>
+  <sub>Windows 10 e 11 (64 bits) · sem instalação: é só extrair · <a href="https://github.com/pedrostyxx/discord-proxy-launcher/releases">todas as versões</a></sub>
 </p>
 
 <p align="center">
@@ -85,9 +85,13 @@ não perto do proxy (veja [Limitações](#limitações)).
 
 ## Como usar
 
-1. **[Baixe o `discord-proxy-launcher.exe`](https://github.com/pedrostyxx/discord-proxy-launcher/releases/latest/download/discord-proxy-launcher.exe).**
-   Não tem instalação: é um arquivo só.
-2. **Abra o arquivo** e aceite o pedido de permissão do Windows — o app pede para rodar como administrador.
+1. **[Baixe o `discord-proxy-launcher.zip`](https://github.com/pedrostyxx/discord-proxy-launcher/releases/latest/download/discord-proxy-launcher.zip)**
+   e extraia (botão direito → **Extrair tudo**). Não tem instalação: o app é a pasta `discord-proxy-launcher`.
+   Abrir direto de dentro do `.zip`, sem extrair, não funciona.
+   - Prefere um arquivo só? Cada [versão](https://github.com/pedrostyxx/discord-proxy-launcher/releases) também
+     traz o `discord-proxy-launcher.exe` avulso, mas navegadores e antivírus desconfiam mais desse formato.
+2. **Abra o `discord-proxy-launcher.exe`** de dentro da pasta extraída e aceite o pedido de permissão do Windows —
+   o app pede para rodar como administrador.
    - Se aparecer *"O Windows protegeu o computador"*, clique em **Mais informações → Executar assim mesmo**. O
      aviso aparece porque o executável ainda não tem assinatura digital (veja [Limitações](#limitações)).
 3. **Escolha o modo:**
@@ -185,7 +189,7 @@ Nada a fazer: o app percebe em poucos segundos e reabre o Discord pelo proxy.
 Feche o app e abra-o de novo pelo PowerShell com a opção `--log` (ajuste o caminho para onde o `.exe` está):
 
 ```powershell
-& "$env:USERPROFILE\Downloads\discord-proxy-launcher.exe" --log
+& "$env:USERPROFILE\Downloads\discord-proxy-launcher\discord-proxy-launcher.exe" --log
 ```
 
 Reproduza o problema e feche o app. Ele terá gravado `discord-proxy-launcher.log` na mesma pasta do `.exe` —
@@ -218,7 +222,10 @@ estiver disponível, um cliente SSH embutido.
 
 - **Sem assinatura digital.** O Windows mostra o aviso do SmartScreen na primeira execução
   (*Mais informações → Executar assim mesmo*). Em PCs com o **Controle Inteligente de Aplicativos** (Smart App
-  Control) ligado, o Windows pode bloquear o executável.
+  Control) ligado, o Windows pode bloquear o executável. Nos primeiros dias de cada versão, o Chrome pode avisar
+  que o arquivo "não é baixado com frequência" (*Manter* na lista de downloads) e alguns antivírus com detecção
+  por heurística podem acusar um falso positivo: é o que acontece com programas novos sem assinatura. O código é
+  aberto, e a página de cada versão traz o SHA-256 dos arquivos para conferência.
 - **Proxies gratuitos são instáveis:** podem ser lentos e cair a qualquer momento. O app troca sozinho e sem
   fechar o Discord, mas uma imagem ou mensagem pode demorar um pouco no instante da troca.
 - **O que sai com o seu IP:** voz, vídeo e compartilhamento de tela nunca passam pelo proxy; com o servidor
@@ -231,12 +238,14 @@ estiver disponível, um cliente SSH embutido.
 
 ## Para desenvolvedores
 
-O app é feito em Python 3.12 com tkinter e compilado com PyInstaller em um `.exe` único. O build oficial embute o
+O app é feito em Python 3.12 com tkinter e compilado com PyInstaller, em pasta (`.zip`) e em `.exe` único, com o
+bootloader do PyInstaller compilado na hora (o pronto é o que mais gera falsos positivos em antivírus) — para isso
+o build precisa do Visual Studio Build Tools com o workload C++. O build oficial embute o
 `dconnect.json` (endereço e token do servidor dedicado), que não fica no repositório — veja
-[server/README.md](server/README.md). Sem ele, compile com `-NoDedicated`: o `.exe` usa só as listas públicas.
+[server/README.md](server/README.md). Sem ele, compile com `-NoDedicated`: o app usa só as listas públicas.
 
 ```powershell
-# compilar: cria o .venv, instala as dependências e gera dist\discord-proxy-launcher.exe
+# compilar: cria o .venv, instala as dependências e gera dist\discord-proxy-launcher.zip e .exe
 powershell -ExecutionPolicy Bypass -File build.ps1 -NoDedicated
 
 # rodar os testes
