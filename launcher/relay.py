@@ -140,6 +140,14 @@ class ProxyRelay:
     # -- o plano de cada conexão --
 
     def _plan(self, host: str, port: int) -> list[_Candidate]:
+        plan = self._proxied_plan(host, port)
+        if destinations.goes_direct_first(host, port):
+            # Mede a rede do usuário (regiões de voz): direto primeiro; os proxies só
+            # correm junto se a internet dele não responder dentro do RELAY_STAGGER.
+            plan = [_Candidate(DIRECT, None)] + [candidate for candidate in plan if candidate.kind != DIRECT]
+        return plan
+
+    def _proxied_plan(self, host: str, port: int) -> list[_Candidate]:
         discord_host = destinations.goes_through_vps(host, port)
         with self._lock:
             active, fallback = self._active, self._fallback

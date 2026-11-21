@@ -73,8 +73,9 @@ O proxy leva o "Discord de texto": login, mensagens, servidores, canais, imagens
 de mídia do próprio Discord, direto para os servidores de voz.
 
 Na prática: **chamadas e compartilhamento de tela funcionam tranquilamente**, sem ficar lentos ou travando por
-causa do proxy — mesmo com os proxies gratuitos. O único efeito é indireto: o Discord pode escolher um servidor de
-voz perto do país do proxy (veja [Limitações](#limitações)).
+causa do proxy — mesmo com os proxies gratuitos. O teste de latência com que o Discord escolhe a região de voz e
+do Go Live (`latency.discord.media`) sai direto pela sua conexão, para que ele escolha servidores perto de você, e
+não perto do proxy (veja [Limitações](#limitações)).
 
 > **Bom saber:** como as chamadas não passam pelo proxy, os servidores de voz do Discord veem o seu IP real
 > durante uma chamada. E, enquanto o app usa o **servidor dedicado**, também saem direto pela sua conexão o envio
@@ -223,8 +224,10 @@ estiver disponível, um cliente SSH embutido.
 - **O que sai com o seu IP:** voz, vídeo e compartilhamento de tela nunca passam pelo proxy; com o servidor
   dedicado, também o envio de anexos, as *Activities* e as integrações (veja acima).
 - **Distância do servidor dedicado:** ele fica na França, então mensagens e imagens levam cerca de 0,2 s a mais
-  para quem está no Brasil. Numa ligação iniciada por quem usa o app, o Discord pode escolher um servidor de voz
-  na Europa; se a voz ficar atrasada, mude a região da chamada (ou do canal de voz) para **Brasil**.
+  para quem está no Brasil. Voz e Go Live usam servidores perto de você (a medição de latência sai direto; se a
+  sua rede bloquear até ela, vai pelo proxy). Até a versão 1.1.0 ela ia pelo proxy: o Go Live era criado na
+  Europa e quem assistia via o erro 2012. Se uma chamada ainda cair num servidor distante, mude a região do canal
+  de voz para **Brasil**.
 
 ## Para desenvolvedores
 

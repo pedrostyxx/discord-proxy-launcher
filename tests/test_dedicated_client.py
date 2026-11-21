@@ -263,6 +263,20 @@ class RelayPlanTest(unittest.TestCase):
         self.assertEqual(self.kinds("gateway.discord.gg"), [relay.PROXY])
         self.assertNotIn(relay.DIRECT, self.kinds("gateway.discord.gg"))     # Discord nunca sai direto
 
+    def test_latency_test_goes_direct_first(self):
+        # As regiões de voz e do Go Live saem do IP de quem mede: pelo proxy, a Europa.
+        self.relay.set_active(vps_entry())
+        self.assertEqual(self.kinds("latency.discord.media"), [relay.DIRECT, relay.VPS, relay.PROXY])
+        self.assertEqual(self.kinds("LATENCY.discord.media."), [relay.DIRECT, relay.VPS, relay.PROXY])
+        self.assertEqual(self.kinds("latency.discord.media", 80), [relay.DIRECT])
+        self.assertEqual(self.kinds("c-gru19-4e33958b.discord.media"), [relay.VPS, relay.PROXY])
+        self.relay.demote_active()
+        self.assertEqual(self.kinds("latency.discord.media"), [relay.DIRECT, relay.PROXY, relay.VPS])
+        other = proxies.Approved(300.0, ("198.51.100.10", 1080), 150.0, time.monotonic(), "DE")
+        self.relay.set_active(other)
+        self.assertEqual(self.kinds("latency.discord.media"),
+                         [relay.DIRECT, relay.PROXY, relay.PROXY, relay.VPS])
+
 
 class RelayVpsTest(unittest.TestCase):
     """O relay com um servidor dedicado de mentira (open_tunnel trocado)."""

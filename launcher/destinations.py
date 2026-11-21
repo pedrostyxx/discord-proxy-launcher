@@ -35,6 +35,15 @@ VPS_EXCLUDED = frozenset({
     "status.hcaptcha.com",          # Atlassian Statuspage (CloudFront)
 })
 VPS_PORTS = frozenset({443})
+# Nomes do Discord que medem a rede de quem usa o app e, por isso, precisam ver o IP
+# real: o teste de latência devolve as regiões de voz perto de quem pergunta. Pelo
+# proxy, ele só oferece servidores da Europa, e o Go Live de quem está no Brasil é
+# criado lá (c-cdg...): a voz funciona, mas o vídeo não chega a quem assiste (erro
+# 2012). Saem direto primeiro; o caminho de sempre fica de reserva, caso a rede
+# bloqueie o Discord.
+DIRECT_FIRST = frozenset({
+    "latency.discord.media",
+})
 
 _LABEL = rb"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _HOSTNAME = re.compile(rb"(?:" + _LABEL + rb"\.)+" + _LABEL)
@@ -74,3 +83,8 @@ def goes_through_vps(host, port: int) -> bool:
     if name is None or port not in VPS_PORTS or name in VPS_EXCLUDED:
         return False
     return any(name == suffix or name.endswith("." + suffix) for suffix in VPS_SUFFIXES)
+
+
+def goes_direct_first(host, port: int) -> bool:
+    """True se a conexão deve tentar a internet do usuário antes de qualquer proxy."""
+    return port in VPS_PORTS and normalize_host(host) in DIRECT_FIRST
